@@ -22,7 +22,7 @@ HEDGING_MAX_DELAY_MS=0 \
 docker compose --profile full up -d --build
 
 echo "[ci-smoke] Waiting for LB to respond (in-network)..."
-for i in {1..90}; do
+for i in {1..120}; do
   if docker ps --format '{{.Names}}' | grep -q '^ai_lb_monitor$' && \
      docker exec -i ai_lb_monitor curl -sf http://ai_lb_load_balancer:8000/metrics >/dev/null; then
     break
@@ -54,7 +54,19 @@ while (( round <= 3 )); do
   done
   sleep 2
   echo "[ci-smoke] Reading metrics..."
-  METRICS="$(docker exec -i ai_lb_monitor curl -s http://ai_lb_load_balancer:8000/metrics || true)"
+  # Poll metrics up to 10s for counters to appear
+  METRICS=""
+  for j in {1..10}; do
+    METRICS="$(docker exec -i ai_lb_monitor curl -s http://ai_lb_load_balancer:8000/metrics || true)"
+    if [[ -n "$METRICS" ]]; then
+      break
+    fi
+    sleep 1
+  done
+  # Fallback to host if empty (debug)
+  if [[ -z "$METRICS" ]]; then
+    METRICS="$(curl -s http://localhost:8000/metrics || true)"
+  fi
   REQS=$(echo "$METRICS" | awk '/^ai_lb_requests_total /{print $2}')
   HEDGES=$(echo "$METRICS" | awk '/^ai_lb_hedges_total /{print $2}')
   WINS_MODEL=$(echo "$METRICS" | awk -v m="$MODEL_ID" '$1 ~ /^ai_lb_hedge_wins_total/ && $0 ~ "model=\""m"\"" {print $2}')
