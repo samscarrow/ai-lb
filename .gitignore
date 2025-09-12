@@ -1,0 +1,9 @@
+*.pyc
+__pycache__/
+.venv/
+.env
+.DS_Store
+.tui_logs/
+**/tui_logs/
+**/__pycache__/
+**/*.pyc
