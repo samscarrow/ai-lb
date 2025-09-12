@@ -21,9 +21,10 @@ HEDGING_SMALL_MODELS_ONLY=false \
 HEDGING_MAX_DELAY_MS=0 \
 docker compose --profile full up -d --build
 
-echo "[ci-smoke] Waiting for LB to respond..."
+echo "[ci-smoke] Waiting for LB to respond (in-network)..."
 for i in {1..90}; do
-  if curl -sf http://localhost:8000/metrics >/dev/null; then
+  if docker ps --format '{{.Names}}' | grep -q '^ai_lb_monitor$' && \
+     docker exec -i ai_lb_monitor curl -sf http://ai_lb_load_balancer:8000/metrics >/dev/null; then
     break
   fi
   sleep 1
@@ -46,14 +47,14 @@ ok=0
 while (( round <= 3 )); do
   echo "[ci-smoke] Round $round: firing 10 non-stream requests to trigger hedging..."
   for i in $(seq 1 10); do
-    curl -s -o /dev/null -X POST http://localhost:8000/v1/chat/completions \
+    docker exec -i ai_lb_monitor curl -s -o /dev/null -X POST http://ai_lb_load_balancer:8000/v1/chat/completions \
       -H 'content-type: application/json' \
       -H 'x-session-id: s' \
       --data '{"model":"'"$MODEL_ID"'","messages":[{"role":"user","content":"hedge attempt '"$i"' (round '"$round"')"}],"max_tokens":8,"stream":false}' || true
   done
   sleep 2
   echo "[ci-smoke] Reading metrics..."
-  METRICS="$(curl -s http://localhost:8000/metrics || true)"
+  METRICS="$(docker exec -i ai_lb_monitor curl -s http://ai_lb_load_balancer:8000/metrics || true)"
   REQS=$(echo "$METRICS" | awk '/^ai_lb_requests_total /{print $2}')
   HEDGES=$(echo "$METRICS" | awk '/^ai_lb_hedges_total /{print $2}')
   WINS_MODEL=$(echo "$METRICS" | awk -v m="$MODEL_ID" '$1 ~ /^ai_lb_hedge_wins_total/ && $0 ~ "model=\""m"\"" {print $2}')
