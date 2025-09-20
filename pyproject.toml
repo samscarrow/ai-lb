@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=67", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ai-lb"
+version = "0.0.1"
+requires-python = ">=3.12"
+dependencies = [
+    "httpx>=0.28.1",
+    "openai>=1.108.1",
+    "rich>=14.1.0",
+]
+
+[dependency-groups]
+dev = ["uv","pytest","black","ruff","setuptools>=67","wheel"]
+
+[tool.uv]
+default-groups = ["dev"]

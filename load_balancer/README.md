@@ -16,6 +16,7 @@ This service is the main user-facing entry point. It receives requests and route
 - Observability headers (non-stream and stream initial response):
   - `x-request-id`, `x-selected-model`, `x-routed-node`, `x-attempts`, `x-failover-count`.
   - `x-capacity-state`: `ok` | `model_saturated` | `cluster_saturated`.
+  - `x-model-defaulted`: `true` when the balancer substitutes a configured default model.
 - Streaming SSE meta events:
   - `event: meta` on first routing; `event: failover` on each failover.
   - Hedging signals (streaming only):
@@ -37,6 +38,7 @@ This service is the main user-facing entry point. It receives requests and route
 - Response
   - Always includes `x-request-id`. On success: `x-selected-model`, `x-routed-node`.
   - Non-stream: also `x-attempts`, `x-failover-count`.
+  - `x-model-defaulted` flags when `DEFAULT_*_MODEL` filled a missing `model` field.
   - 429 includes `Retry-After` seconds.
 - Streaming SSE prelude
   - `event: meta` with `{request_id, model, node, attempts: 1, failover_count: 0}`.
@@ -50,6 +52,8 @@ This service is the main user-facing entry point. It receives requests and route
   - `LM_MODEL`: default `auto`.
   - `PREFERRED_MODELS`: comma/semicolon list, optional.
   - `AUTO_MODEL_STRATEGY`: `any_first` (default) | `intersection_first`.
+  - `DEFAULT_CHAT_MODEL`: optional concrete model used when chat requests omit `model`.
+  - `DEFAULT_EMBEDDINGS_MODEL`: optional concrete model used when embeddings requests omit `model`.
 - Timeouts/retries
   - `REQUEST_TIMEOUT_SECS` (default 60), `MAX_RETRIES` (default 2).
   - `RETRY_AFTER_SECS` (default 2) for 429.
@@ -99,3 +103,7 @@ Notes:
 ## Notes
 
 - Streaming headers reflect the initial routed node only; if a failover occurs mid-stream, headers won’t change (see SSE events for failovers).
+- Request validation
+  - `chat.completions` requires either `messages`, `prompt`, or `input`; otherwise a `400` is returned with `{"missing": [...]}`.
+  - `embeddings` requires `input`.
+  - When defaults are configured, missing `model` fields are filled automatically and logged for observability.

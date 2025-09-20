@@ -19,6 +19,10 @@ from load_balancer import main as lb_main
 from load_balancer.routing.strategies import get_routing_strategy
 
 
+def run(coro):
+    return asyncio.run(coro)
+
+
 class FakeRedis:
     def __init__(self):
         self.kv = {}
@@ -129,8 +133,8 @@ def test_models_aggregate_unique(monkeypatch):
     r = lb_main.redis_client
     r.sets["nodes:healthy"] = {"n1", "n2"}
     # Both nodes advertise overlapping models
-    asyncio.get_event_loop().run_until_complete(r.set("node:n1:models", json.dumps({"data": [{"id": "m1"}]})))
-    asyncio.get_event_loop().run_until_complete(r.set("node:n2:models", json.dumps({"data": [{"id": "m1"}, {"id": "m2"}]})))
+    run(r.set("node:n1:models", json.dumps({"data": [{"id": "m1"}]})))
+    run(r.set("node:n2:models", json.dumps({"data": [{"id": "m1"}, {"id": "m2"}]})))
     with make_client() as c:
         resp = c.get("/v1/models")
         assert resp.status_code == 200
@@ -142,8 +146,8 @@ def test_routing_round_robin_and_failover(monkeypatch):
     # Configure two eligible nodes
     r = lb_main.redis_client
     r.sets["nodes:healthy"] = {"n1", "n2"}
-    asyncio.get_event_loop().run_until_complete(r.set("node:n1:models", json.dumps({"data": [{"id": "m"}]})))
-    asyncio.get_event_loop().run_until_complete(r.set("node:n2:models", json.dumps({"data": [{"id": "m"}]})))
+    run(r.set("node:n1:models", json.dumps({"data": [{"id": "m"}]})))
+    run(r.set("node:n2:models", json.dumps({"data": [{"id": "m"}]})))
 
     # First attempt: n1 fails, should fail over to n2
     behavior = {
@@ -153,27 +157,78 @@ def test_routing_round_robin_and_failover(monkeypatch):
     lb_main.http_client = FakeHTTPClient(behavior)
 
     with make_client() as c:
-        resp = c.post("/v1/chat/completions", json={"model": "m"})
+        resp = c.post(
+            "/v1/chat/completions",
+            json={
+                "model": "m",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": True,
+            },
+        )
         text = b"".join(resp.iter_bytes())
         assert b"ok" in text
+
+
+def test_chat_missing_model_applies_default(monkeypatch):
+    r = lb_main.redis_client
+    r.sets["nodes:healthy"] = {"solo"}
+    run(r.set("node:solo:models", json.dumps({"data": [{"id": "m"}]})))
+
+    lb_main.http_client = FakeHTTPClient({"solo": {"chunks": [b"data: hi\n\n"]}})
+
+    with make_client() as c:
+        resp = c.post(
+            "/v1/chat/completions",
+            json={
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": True,
+            },
+        )
+        body = b"".join(resp.iter_bytes())
+        assert resp.status_code == 200
+        assert b"hi" in body
+        assert resp.headers.get("x-selected-model") == "m"
+        assert resp.headers.get("x-model-defaulted") == "true"
+
+
+def test_chat_missing_messages_returns_400(monkeypatch):
+    r = lb_main.redis_client
+    r.sets["nodes:healthy"] = {"solo"}
+    run(r.set("node:solo:models", json.dumps({"data": [{"id": "m"}]})))
+
+    lb_main.http_client = FakeHTTPClient({"solo": {"chunks": [b"data: hi\n\n"]}})
+
+    with make_client() as c:
+        resp = c.post("/v1/chat/completions", json={"model": "m"})
+        assert resp.status_code == 400
+        detail = resp.json().get("detail")
+        assert detail["message"].startswith("Missing")
+        assert detail["missing"] == ["messages"]
 
 
 def test_performance_under_load(monkeypatch):
     # One healthy node responds quickly
     r = lb_main.redis_client
     r.sets["nodes:healthy"] = {"fast"}
-    asyncio.get_event_loop().run_until_complete(r.set("node:fast:models", json.dumps({"data": [{"id": "m"}]})))
+    run(r.set("node:fast:models", json.dumps({"data": [{"id": "m"}]})))
     lb_main.http_client = FakeHTTPClient({"fast": {"chunks": [b"data: x\n\n"]}})
 
     with make_client() as c:
         # Fire off many concurrent requests and ensure all return quickly
         async def one():
-            return c.post("/v1/chat/completions", json={"model": "m"}).status_code
+            return c.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "m",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": True,
+                },
+            ).status_code
 
         async def many(n=100):
             return await asyncio.gather(*[one() for _ in range(n)])
 
-        codes = asyncio.get_event_loop().run_until_complete(many())
+        codes = run(many())
         assert all(code == 200 for code in codes)
 
 
@@ -185,8 +240,8 @@ def test_circuit_breaker_skips_failed_node(monkeypatch):
 
     r = lb_main.redis_client
     r.sets["nodes:healthy"] = {"flaky", "good"}
-    asyncio.get_event_loop().run_until_complete(r.set("node:flaky:models", json.dumps({"data": [{"id": "m"}]})))
-    asyncio.get_event_loop().run_until_complete(r.set("node:good:models", json.dumps({"data": [{"id": "m"}]})))
+    run(r.set("node:flaky:models", json.dumps({"data": [{"id": "m"}]})))
+    run(r.set("node:good:models", json.dumps({"data": [{"id": "m"}]})))
 
     # First request: flaky fails, triggers CB open
     lb_main.http_client = FakeHTTPClient({
@@ -194,10 +249,24 @@ def test_circuit_breaker_skips_failed_node(monkeypatch):
         "good": {"chunks": [b"data: ok\n\n"]},
     })
     with make_client() as c:
-        resp1 = c.post("/v1/chat/completions", json={"model": "m"})
+        resp1 = c.post(
+            "/v1/chat/completions",
+            json={
+                "model": "m",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": True,
+            },
+        )
         _ = b"".join(resp1.iter_bytes())
         # Second request should skip flaky and go straight to good
-        resp2 = c.post("/v1/chat/completions", json={"model": "m"})
+        resp2 = c.post(
+            "/v1/chat/completions",
+            json={
+                "model": "m",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": True,
+            },
+        )
         text2 = b"".join(resp2.iter_bytes())
         assert b"ok" in text2
 
@@ -205,9 +274,9 @@ def test_circuit_breaker_skips_failed_node(monkeypatch):
 def test_metrics_endpoint(monkeypatch):
     r = lb_main.redis_client
     r.sets["nodes:healthy"] = {"n1"}
-    asyncio.get_event_loop().run_until_complete(r.set("node:n1:inflight", 3))
-    asyncio.get_event_loop().run_until_complete(r.set("node:n1:failures", 2))
-    asyncio.get_event_loop().run_until_complete(r.set("lb:requests_total", 42))
+    run(r.set("node:n1:inflight", 3))
+    run(r.set("node:n1:failures", 2))
+    run(r.set("lb:requests_total", 42))
     with make_client() as c:
         resp = c.get("/metrics")
         body = resp.text
@@ -221,18 +290,29 @@ def test_sticky_sessions_prefer_same_node(monkeypatch):
     # Two nodes can serve model; first response from n2, second should prefer n2 via stickiness
     from load_balancer import config as cfg
     cfg.STICKY_SESSIONS_ENABLED = True
+    lb_main.router = get_routing_strategy("ROUND_ROBIN")
+    from load_balancer.routing.strategies import ROUND_ROBIN_STATE
+    ROUND_ROBIN_STATE.clear()
     r = lb_main.redis_client
     r.sets["nodes:healthy"] = {"n1", "n2"}
-    asyncio.get_event_loop().run_until_complete(r.set("node:n1:models", json.dumps({"data": [{"id": "m"}]})))
-    asyncio.get_event_loop().run_until_complete(r.set("node:n2:models", json.dumps({"data": [{"id": "m"}]})))
+    run(r.set("node:n1:models", json.dumps({"data": [{"id": "m"}]})))
+    run(r.set("node:n2:models", json.dumps({"data": [{"id": "m"}]})))
 
     # First call: only n2 returns content successfully
     lb_main.http_client = FakeHTTPClient({
-        "n1": {"chunks": []},
+        "n1": {"error": RequestError("boom", request=None)},
         "n2": {"chunks": [b"data: n2\n\n"]},
     })
     with make_client() as c:
-        resp1 = c.post("/v1/chat/completions", headers={"x-session-id": "s"}, json={"model": "m"})
+        resp1 = c.post(
+            "/v1/chat/completions",
+            headers={"x-session-id": "s"},
+            json={
+                "model": "m",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": True,
+            },
+        )
         out1 = b"".join(resp1.iter_bytes())
         assert b"n2" in out1
 
@@ -242,7 +322,15 @@ def test_sticky_sessions_prefer_same_node(monkeypatch):
         "n2": {"chunks": [b"data: again n2\n\n"]},
     })
     with make_client() as c:
-        resp2 = c.post("/v1/chat/completions", headers={"x-session-id": "s"}, json={"model": "m"})
+        resp2 = c.post(
+            "/v1/chat/completions",
+            headers={"x-session-id": "s"},
+            json={
+                "model": "m",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": True,
+            },
+        )
         out2 = b"".join(resp2.iter_bytes())
         assert b"again n2" in out2
 
@@ -264,8 +352,8 @@ def test_hedging_non_stream_winner_and_headers(monkeypatch):
 
     r = lb_main.redis_client
     r.sets["nodes:healthy"] = {"n1", "n2"}
-    asyncio.get_event_loop().run_until_complete(r.set("node:n1:models", json.dumps({"data": [{"id": "m"}]})))
-    asyncio.get_event_loop().run_until_complete(r.set("node:n2:models", json.dumps({"data": [{"id": "m"}]})))
+    run(r.set("node:n1:models", json.dumps({"data": [{"id": "m"}]})))
+    run(r.set("node:n2:models", json.dumps({"data": [{"id": "m"}]})))
 
     # Primary (n1) will be slow relative to zero delay (i.e., not finished before hedge starts),
     # but we also want it to fail to ensure hedge succeeds first.
@@ -275,7 +363,14 @@ def test_hedging_non_stream_winner_and_headers(monkeypatch):
     })
 
     with make_client() as c:
-        resp = c.post("/v1/chat/completions", json={"model": "m"})
+        resp = c.post(
+            "/v1/chat/completions",
+            json={
+                "model": "m",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": True,
+            },
+        )
         assert resp.status_code == 200
         # Optional headers: verify shape if present
         if resp.headers.get("x-hedged"):
@@ -284,7 +379,6 @@ def test_hedging_non_stream_winner_and_headers(monkeypatch):
             assert resp.headers.get("x-hedge-winner") in ("n1", "n2", "")
 
 
-@pytest.mark.xfail(reason="Streaming hedging race conditions in test harness; validated non-stream hedging.", strict=False)
 def test_streaming_hedge_zero_delay(monkeypatch):
     # Configure hedging zero delay and small-model classification
     from load_balancer import config as cfg
@@ -297,22 +391,42 @@ def test_streaming_hedge_zero_delay(monkeypatch):
     }
 
     lb_main.router = get_routing_strategy("ROUND_ROBIN")
+    from load_balancer.routing.strategies import ROUND_ROBIN_STATE
+    ROUND_ROBIN_STATE.clear()
 
     r = lb_main.redis_client
     r.sets["nodes:healthy"] = {"n1", "n2"}
-    asyncio.get_event_loop().run_until_complete(r.set("node:n1:models", json.dumps({"data": [{"id": "m"}]})))
-    asyncio.get_event_loop().run_until_complete(r.set("node:n2:models", json.dumps({"data": [{"id": "m"}]})))
+    run(r.set("node:n1:models", json.dumps({"data": [{"id": "m"}]})))
+    run(r.set("node:n2:models", json.dumps({"data": [{"id": "m"}]})))
 
     # Primary fails immediately, secondary streams
-    lb_main.http_client = FakeHTTPClient({
-        "n1": {"error": RequestError("boom", request=None)},
-        "n2": {"chunks": [b"data: win\n\n"]},
-    })
+    class HedgeHarnessHTTPClient(FakeHTTPClient):
+        def __init__(self):
+            super().__init__({})
+            self._calls = 0
+
+        def stream(self, method, url, json=None, headers=None):
+            self._calls += 1
+            if self._calls == 1:
+                return FakeStreamResponse([], raise_on_enter=RequestError("boom", request=None))
+            return FakeStreamResponse([b"data: win\n\n"], status_code=200)
+
+    lb_main.http_client = HedgeHarnessHTTPClient()
 
     with make_client() as c:
-        resp = c.post("/v1/chat/completions", json={"model": "m", "stream": True})
+        resp = c.post(
+            "/v1/chat/completions",
+            json={
+                "model": "m",
+                "stream": True,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
         body = b"".join(resp.iter_bytes())
+        assert resp.status_code == 200
+        assert b"event: hedge_start" in body
         assert b"win" in body
+        assert b"error" not in body
 
 
 def test_streaming_hedge_events_deterministic(monkeypatch):
@@ -328,10 +442,10 @@ def test_streaming_hedge_events_deterministic(monkeypatch):
 
     r = lb_main.redis_client
     r.sets["nodes:healthy"] = {"n1", "n2"}
-    asyncio.get_event_loop().run_until_complete(r.set("node:n1:models", json.dumps({"data": [{"id": "q"}]})))
-    asyncio.get_event_loop().run_until_complete(r.set("node:n2:models", json.dumps({"data": [{"id": "q"}]})))
+    run(r.set("node:n1:models", json.dumps({"data": [{"id": "q"}]})))
+    run(r.set("node:n2:models", json.dumps({"data": [{"id": "q"}]})))
     # Force stickiness so primary is n1
-    asyncio.get_event_loop().run_until_complete(r.set("session:s:q", "n1"))
+    run(r.set("session:s:q", "n1"))
 
     lb_main.http_client = FakeHTTPClient({
         "n1": {"chunks": [b"data: slow\n\n"], "status": 200, "first_chunk_delay_ms": 200},
@@ -339,7 +453,15 @@ def test_streaming_hedge_events_deterministic(monkeypatch):
     })
 
     with make_client() as c:
-        resp = c.post("/v1/chat/completions", headers={"x-session-id": "s"}, json={"model": "q", "stream": True})
+        resp = c.post(
+            "/v1/chat/completions",
+            headers={"x-session-id": "s"},
+            json={
+                "model": "q",
+                "stream": True,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
         body = b"".join(resp.iter_bytes())
         # Expect hedge events and winner n2
         assert b"event: hedge_start" in body
@@ -354,13 +476,13 @@ def test_least_loaded_respects_maxconn(monkeypatch):
     r = lb_main.redis_client
     r.sets["nodes:healthy"] = {"n1", "n2"}
     # Both nodes host the same model
-    asyncio.get_event_loop().run_until_complete(r.set("node:n1:models", json.dumps({"data": [{"id": "m"}]})))
-    asyncio.get_event_loop().run_until_complete(r.set("node:n2:models", json.dumps({"data": [{"id": "m"}]})))
+    run(r.set("node:n1:models", json.dumps({"data": [{"id": "m"}]})))
+    run(r.set("node:n2:models", json.dumps({"data": [{"id": "m"}]})))
     # n1 at capacity: inflight == maxconn
-    asyncio.get_event_loop().run_until_complete(r.set("node:n1:inflight", 1))
-    asyncio.get_event_loop().run_until_complete(r.set("node:n1:maxconn", 1))
+    run(r.set("node:n1:inflight", 1))
+    run(r.set("node:n1:maxconn", 1))
     # n2 has free capacity
-    asyncio.get_event_loop().run_until_complete(r.set("node:n2:inflight", 0))
+    run(r.set("node:n2:inflight", 0))
 
     # If routing mistakenly chooses n1, we will see 'bad' in stream
     lb_main.http_client = FakeHTTPClient({
@@ -369,7 +491,14 @@ def test_least_loaded_respects_maxconn(monkeypatch):
     })
 
     with make_client() as c:
-        resp = c.post("/v1/chat/completions", json={"model": "m"})
+        resp = c.post(
+            "/v1/chat/completions",
+            json={
+                "model": "m",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": True,
+            },
+        )
         out = b"".join(resp.iter_bytes())
         assert b"ok" in out
         assert b"bad" not in out

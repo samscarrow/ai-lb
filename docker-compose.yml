@@ -1,3 +1,7 @@
+x-redis-env: &redis-env
+  REDIS_HOST: ${REDIS_HOST:-redis}
+  REDIS_PORT: ${REDIS_PORT:-6379}
+
 services:
   redis:
     image: "redis:alpine"
@@ -12,16 +16,20 @@ services:
     build:
       context: ./monitor
     container_name: ai_lb_monitor
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+      - "pc-sam:host-gateway"
+      - "sams-macbook-pro:host-gateway"
+      - "macbook:host-gateway"
     environment:
-      - REDIS_HOST=redis
-      - REDIS_PORT=${REDIS_PORT:-6379}
+      <<: *redis-env
       # Hosts to scan for LMStudio or other upstreams
-      - SCAN_HOSTS=${SCAN_HOSTS:-}
-      - SCAN_PORTS=${SCAN_PORTS:-1234}
-      - SCAN_INTERVAL=${SCAN_INTERVAL:-60}
+      SCAN_HOSTS: ${SCAN_HOSTS:-}
+      SCAN_PORTS: ${SCAN_PORTS:-1234}
+      SCAN_INTERVAL: ${SCAN_INTERVAL:-60}
       # Optional concurrency caps for the LB's LEAST_LOADED strategy
-      - DEFAULT_MAXCONN=${DEFAULT_MAXCONN:-0}
-      - MAXCONN_MAP=${MAXCONN_MAP:-}
+      DEFAULT_MAXCONN: ${DEFAULT_MAXCONN:-0}
+      MAXCONN_MAP: ${MAXCONN_MAP:-}
     depends_on:
       - redis
     restart: unless-stopped
@@ -32,35 +40,39 @@ services:
     build:
       context: ./load_balancer
     container_name: ai_lb_load_balancer
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+      - "pc-sam:host-gateway"
+      - "sams-macbook-pro:host-gateway"
+      - "macbook:host-gateway"
     environment:
-      - REDIS_HOST=redis
-      - REDIS_PORT=${REDIS_PORT:-6379}
+      <<: *redis-env
       # Routing/selection
-      - ROUTING_STRATEGY=${ROUTING_STRATEGY:-P2C}
-      - REQUEST_TIMEOUT_SECS=${REQUEST_TIMEOUT_SECS:-60}
-      - ATTEMPTS_PER_MODEL=${ATTEMPTS_PER_MODEL:-3}
-      - RETRY_BACKOFF_MS=${RETRY_BACKOFF_MS:-50,100}
-      - CIRCUIT_BREAKER_THRESHOLD=${CIRCUIT_BREAKER_THRESHOLD:-3}
-      - CIRCUIT_BREAKER_COOLDOWN_SECS=${CIRCUIT_BREAKER_COOLDOWN_SECS:-60}
-      - MODEL_SENTINELS=${MODEL_SENTINELS:-auto,default}
-      - PREFERRED_MODELS=${PREFERRED_MODELS:-}
-      - AUTO_MIN_NODES=${AUTO_MIN_NODES:-2}
-      - STRICT_AUTO_MODE=${STRICT_AUTO_MODE:-0}
-      - LM_PREFER_SMALL=${LM_PREFER_SMALL:-1}
-      - CROSS_MODEL_FALLBACK=${CROSS_MODEL_FALLBACK:-0}
+      ROUTING_STRATEGY: ${ROUTING_STRATEGY:-P2C}
+      REQUEST_TIMEOUT_SECS: ${REQUEST_TIMEOUT_SECS:-60}
+      ATTEMPTS_PER_MODEL: ${ATTEMPTS_PER_MODEL:-3}
+      RETRY_BACKOFF_MS: ${RETRY_BACKOFF_MS:-50,100}
+      CIRCUIT_BREAKER_THRESHOLD: ${CIRCUIT_BREAKER_THRESHOLD:-3}
+      CIRCUIT_BREAKER_COOLDOWN_SECS: ${CIRCUIT_BREAKER_COOLDOWN_SECS:-60}
+      MODEL_SENTINELS: ${MODEL_SENTINELS:-auto,default}
+      PREFERRED_MODELS: ${PREFERRED_MODELS:-}
+      AUTO_MIN_NODES: ${AUTO_MIN_NODES:-2}
+      STRICT_AUTO_MODE: ${STRICT_AUTO_MODE:-0}
+      LM_PREFER_SMALL: ${LM_PREFER_SMALL:-1}
+      CROSS_MODEL_FALLBACK: ${CROSS_MODEL_FALLBACK:-0}
       # Stickiness (only used when x-session-id present)
-      - STICKY_SESSIONS_ENABLED=${STICKY_SESSIONS_ENABLED:-false}
-      - STICKY_TTL_SECS=${STICKY_TTL_SECS:-600}
+      STICKY_SESSIONS_ENABLED: ${STICKY_SESSIONS_ENABLED:-false}
+      STICKY_TTL_SECS: ${STICKY_TTL_SECS:-600}
       # P2C tuning
-      - P2C_ALPHA=${P2C_ALPHA:-0.5}
-      - P2C_PENALTY_WEIGHT=${P2C_PENALTY_WEIGHT:-2.0}
+      P2C_ALPHA: ${P2C_ALPHA:-0.5}
+      P2C_PENALTY_WEIGHT: ${P2C_PENALTY_WEIGHT:-2.0}
       # Hedging
-      - HEDGING_ENABLED=${HEDGING_ENABLED:-true}
-      - HEDGING_SMALL_MODELS_ONLY=${HEDGING_SMALL_MODELS_ONLY:-true}
-      - HEDGING_MAX_DELAY_MS=${HEDGING_MAX_DELAY_MS:-800}
-      - HEDGING_P95_FRACTION=${HEDGING_P95_FRACTION:-0.6}
+      HEDGING_ENABLED: ${HEDGING_ENABLED:-true}
+      HEDGING_SMALL_MODELS_ONLY: ${HEDGING_SMALL_MODELS_ONLY:-true}
+      HEDGING_MAX_DELAY_MS: ${HEDGING_MAX_DELAY_MS:-800}
+      HEDGING_P95_FRACTION: ${HEDGING_P95_FRACTION:-0.6}
       # Eligibility thresholds
-      - MAX_P95_LATENCY_SECS=${MAX_P95_LATENCY_SECS:-5.0}
+      MAX_P95_LATENCY_SECS: ${MAX_P95_LATENCY_SECS:-5.0}
     depends_on:
       - redis
     restart: unless-stopped

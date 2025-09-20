@@ -7,3 +7,8 @@ __pycache__/
 **/tui_logs/
 **/__pycache__/
 **/*.pyc
+.codex-agent-profile.json
+.envrc
+lm-lb
+src/ai_lb.egg-info/
+2025-09-12-implement-these-changes-in-ai-lb.txt

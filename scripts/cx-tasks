@@ -1,0 +1,2 @@
+#!/usr/bin/env bash
+exec /usr/bin/python3 ~/.codex/codex-enhanced.py /tasks "$@"

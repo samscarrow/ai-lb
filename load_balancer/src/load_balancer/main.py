@@ -8,26 +8,14 @@ from fastapi import FastAPI, Request, Response, HTTPException
 from fastapi.responses import StreamingResponse
 import uuid
 import asyncio
+from contextlib import asynccontextmanager
 
 from . import config
+from .request_validation import sanitize_chat_request, sanitize_embeddings_request
 from .routing.strategies import get_routing_strategy
 
-app = FastAPI(title="AI Load Balancer")
-redis_client = None
-http_client = None
-router = None
-logger = logging.getLogger("ai_lb")
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-
-# Helper to resolve circuit breaker cooldown consistently across legacy and new config
-def _cb_cooldown_secs() -> int:
-    try:
-        return int(getattr(config, "CIRCUIT_BREAKER_COOLDOWN_SECS", config.CIRCUIT_BREAKER_TTL_SECS))
-    except Exception:
-        return 60
-
-@app.on_event("startup")
-async def startup_event():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     global redis_client, http_client, router
     logger.info("Load balancer starting up...")
     if redis_client is None:
@@ -40,23 +28,37 @@ async def startup_event():
             logger.info("Using routing strategy: %s", config.ROUTING_STRATEGY)
         except ValueError as e:
             logger.error("Error selecting strategy: %s", e)
-            # Default to Round Robin if config is invalid
             router = get_routing_strategy("ROUND_ROBIN")
             logger.info("Defaulting to routing strategy: ROUND_ROBIN")
+    try:
+        yield
+    finally:
+        if redis_client is not None:
+            try:
+                await redis_client.close()
+            except Exception:
+                pass
+        if http_client is not None:
+            try:
+                await http_client.aclose()
+            except Exception:
+                pass
+        logger.info("Load balancer shut down.")
 
-@app.on_event("shutdown")
-async def shutdown_event():
-    if redis_client is not None:
-        try:
-            await redis_client.close()
-        except Exception:
-            pass
-    if http_client is not None:
-        try:
-            await http_client.aclose()
-        except Exception:
-            pass
-    logger.info("Load balancer shut down.")
+
+app = FastAPI(title="AI Load Balancer", lifespan=lifespan)
+redis_client = None
+http_client = None
+router = None
+logger = logging.getLogger("ai_lb")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+# Helper to resolve circuit breaker cooldown consistently across legacy and new config
+def _cb_cooldown_secs() -> int:
+    try:
+        return int(getattr(config, "CIRCUIT_BREAKER_COOLDOWN_SECS", config.CIRCUIT_BREAKER_TTL_SECS))
+    except Exception:
+        return 60
 
 async def _series_p95(model: str, node: str) -> float:
     """Approximate p95 from cumulative histogram buckets stored in Redis.
@@ -127,7 +129,7 @@ def _is_small_model(model: str) -> bool:
 
 async def get_eligible_nodes(model_name: str):
     """Find healthy nodes that advertise the model and meet eligibility: not tripped and under p95 threshold."""
-    healthy_nodes = await redis_client.smembers("nodes:healthy")
+    healthy_nodes = sorted(await redis_client.smembers("nodes:healthy"))
     eligible_nodes = []
     for node in healthy_nodes:
         # Skip nodes on open circuit for this period
@@ -162,7 +164,7 @@ async def get_eligible_nodes(model_name: str):
 
 async def _aggregate_models() -> list:
     """Return a list of unique model dicts aggregated across healthy nodes."""
-    healthy_nodes = await redis_client.smembers("nodes:healthy")
+    healthy_nodes = sorted(await redis_client.smembers("nodes:healthy"))
     all_models = {}
     for node in healthy_nodes:
         models_json = await redis_client.get(f"node:{node}:models")
@@ -179,7 +181,7 @@ async def _aggregate_models() -> list:
 
 async def _aggregate_models_by_node() -> dict:
     """Return mapping node -> list of model ids for healthy nodes."""
-    healthy_nodes = await redis_client.smembers("nodes:healthy")
+    healthy_nodes = sorted(await redis_client.smembers("nodes:healthy"))
     out = {}
     for node in healthy_nodes:
         models_json = await redis_client.get(f"node:{node}:models")
@@ -314,7 +316,7 @@ async def list_eligible_nodes(model: str):
 @app.get("/v1/debug/eligible")
 async def debug_eligible(model: str):
     """Debug endpoint: shows how eligibility is computed per node."""
-    healthy_nodes = list(await redis_client.smembers("nodes:healthy"))
+    healthy_nodes = sorted(await redis_client.smembers("nodes:healthy"))
     details = []
     for node in healthy_nodes:
         item = {"node": node, "has_model": False, "cb_open": False, "p95": None, "skipped": False, "reason": ""}
@@ -600,9 +602,33 @@ async def _record_stream_duration(model: str, node: str, elapsed_secs: float):
 @app.api_route("/v1/chat/completions", methods=["POST"])
 async def chat_completions(request: Request):
     """Receives a chat completion request, routes it, and streams the response."""
-    body = await request.json()
-    model_name = body.get("model")
+    try:
+        raw_body = await request.json()
+    except json.JSONDecodeError as exc:
+        logger.warning("Invalid JSON payload for /v1/chat/completions: %s", exc)
+        raise HTTPException(status_code=400, detail="Request body must be valid JSON.")
+    except Exception as exc:
+        logger.warning("Failed to parse JSON payload for /v1/chat/completions: %s", exc)
+        raise HTTPException(status_code=400, detail="Request body must be valid JSON.")
+
+    sanitized = sanitize_chat_request(raw_body)
+    if sanitized.default_applied:
+        logger.info(
+            "Chat request missing model; applied default '%s'", sanitized.default_applied
+        )
+    if sanitized.missing_fields:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": "Missing required fields.",
+                "missing": sanitized.missing_fields,
+            },
+        )
+
+    body = sanitized.payload
+    model_name = sanitized.model_name
     is_stream = bool(body.get("stream", False))
+    model_defaulted = sanitized.default_applied is not None
     start_time = time.monotonic()
 
     # Resolve auto/default sentinel to a concrete model id
@@ -613,9 +639,6 @@ async def chat_completions(request: Request):
             raise HTTPException(status_code=404, detail="No models available for auto selection.")
         body["model"] = resolved
         model_name = resolved
-
-    if not model_name:
-        raise HTTPException(status_code=400, detail="'model' field is required.")
 
     eligible_nodes = await get_eligible_nodes(model_name)
 
@@ -977,6 +1000,7 @@ async def chat_completions(request: Request):
                 "x-on-demand-wait": "true" if on_demand_wait else "false",
                 "x-warm-wait-ms": str(warm_wait_ms),
                 "x-capacity-state": "ok",
+                "x-model-defaulted": "true" if model_defaulted else "false",
             })
         else:
             # Pre-check: if all nodes saturated (inflight >= maxconn), respond 429 immediately
@@ -1032,6 +1056,7 @@ async def chat_completions(request: Request):
                 "x-on-demand-wait": "true" if on_demand_wait else "false",
                 "x-warm-wait-ms": str(warm_wait_ms),
                 "x-capacity-state": "ok",
+                "x-model-defaulted": "true" if model_defaulted else "false",
             })
 
     # Non-streaming behavior: aggregate JSON and return a Response
@@ -1077,6 +1102,7 @@ async def chat_completions(request: Request):
             out.headers["x-on-demand-wait"] = "true" if on_demand_wait else "false"
             out.headers["x-warm-wait-ms"] = str(warm_wait_ms)
             out.headers["x-capacity-state"] = "ok"
+            out.headers["x-model-defaulted"] = "true" if model_defaulted else "false"
             # Success: set sticky mapping
             await _set_sticky_node(session_id, model_name, node)
             return out
@@ -1340,8 +1366,33 @@ async def chat_completions(request: Request):
 
 @app.api_route("/v1/embeddings", methods=["POST"])
 async def embeddings(request: Request):
-    body = await request.json()
-    model_name = body.get("model")
+    try:
+        raw_body = await request.json()
+    except json.JSONDecodeError as exc:
+        logger.warning("Invalid JSON payload for /v1/embeddings: %s", exc)
+        raise HTTPException(status_code=400, detail="Request body must be valid JSON.")
+    except Exception as exc:
+        logger.warning("Failed to parse JSON payload for /v1/embeddings: %s", exc)
+        raise HTTPException(status_code=400, detail="Request body must be valid JSON.")
+
+    sanitized = sanitize_embeddings_request(raw_body)
+    if sanitized.default_applied:
+        logger.info(
+            "Embeddings request missing model; applied default '%s'", sanitized.default_applied
+        )
+    if sanitized.missing_fields:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": "Missing required fields.",
+                "missing": sanitized.missing_fields,
+            },
+        )
+
+    body = sanitized.payload
+    model_name = sanitized.model_name
+    model_defaulted = sanitized.default_applied is not None
+
     if _is_model_sentinel(model_name):
         prefer_intersection = request.query_params.get("require_all", "false").lower() in ("1", "true", "yes")
         resolved = await _resolve_auto_model(prefer_intersection=prefer_intersection)
@@ -1349,9 +1400,6 @@ async def embeddings(request: Request):
             raise HTTPException(status_code=404, detail="No models available for auto selection.")
         body["model"] = resolved
         model_name = resolved
-    if not model_name:
-        raise HTTPException(status_code=400, detail="'model' field is required.")
-
     eligible_nodes = await get_eligible_nodes_for_model(model_name)
     on_demand_wait = False
     warm_wait_ms = 0
@@ -1413,6 +1461,7 @@ async def embeddings(request: Request):
             out.headers["x-on-demand-wait"] = "true" if on_demand_wait else "false"
             out.headers["x-warm-wait-ms"] = str(warm_wait_ms)
             out.headers["x-capacity-state"] = "ok"
+            out.headers["x-model-defaulted"] = "true" if model_defaulted else "false"
             await _set_sticky_node(session_id, model_name, node)
             return out
         finally:
