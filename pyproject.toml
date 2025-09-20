@@ -10,10 +10,20 @@ dependencies = [
     "httpx>=0.28.1",
     "openai>=1.108.1",
     "rich>=14.1.0",
+    "fastapi>=0.115.5",
+    "uvicorn>=0.32.1",
+    "redis>=5.0.8",
 ]
 
 [dependency-groups]
-dev = ["uv","pytest","black","ruff","setuptools>=67","wheel"]
+dev = [
+    "uv",
+    "pytest",
+    "black",
+    "ruff",
+    "setuptools>=67",
+    "wheel",
+]
 
 [tool.uv]
 default-groups = ["dev"]
