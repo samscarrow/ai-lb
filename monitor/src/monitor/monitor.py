@@ -5,8 +5,8 @@ import config
 
 # Set a timeout for network requests
 CLIENT_TIMEOUT = httpx.Timeout(30.0)
-# Keys should expire if a node is not seen for 2 scan intervals
-KEY_EXPIRY_SECONDS = config.SCAN_INTERVAL * 2
+# Keys should expire if a node is not seen for 5 scan intervals
+KEY_EXPIRY_SECONDS = config.SCAN_INTERVAL * 5
 
 async def check_node(redis_client: redis.Redis, session: httpx.AsyncClient, host: str, port: int):
     """

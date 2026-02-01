@@ -1,0 +1,2 @@
+        "tool_calls": [asdict(call) for call in result.tool_calls],
+    

@@ -154,8 +154,8 @@ async def run(lb: str, model: str, prompt: str, total: int, concurrency: int, st
 
 def main():
     ap = argparse.ArgumentParser(description="Simple async stress tool for AI-LB")
-    ap.add_argument("--lb", default="http://localhost:8000", help="Load balancer base URL")
-    ap.add_argument("--model", required=True, help="Model id or 'auto'")
+    ap.add_argument("--lb", default="http://localhost:8001", help="Load balancer base URL")
+    ap.add_argument("--model", default="auto", help="Model id or 'auto'")
     ap.add_argument("--prompt", default="Say hello", help="Prompt to send")
     ap.add_argument("--requests", type=int, default=100, help="Total number of requests")
     ap.add_argument("--concurrency", type=int, default=20, help="Number of concurrent requests")
