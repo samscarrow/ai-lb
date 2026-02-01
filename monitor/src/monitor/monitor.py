@@ -48,9 +48,12 @@ async def check_node(redis_client: redis.Redis, session: httpx.AsyncClient, host
 
     except (httpx.RequestError, httpx.HTTPStatusError) as e:
         # If the node was previously healthy, remove it
-        if await redis_client.sismember("nodes:healthy", node_address):
+        is_healthy = await redis_client.sismember("nodes:healthy", node_address)
+        if is_healthy:
             print(f"❌ Node {node_address} is no longer healthy. Removing. Reason: {e}")
             await redis_client.srem("nodes:healthy", node_address)
+        else:
+            print(f"⚠️ Node {node_address} check failed. Reason: {repr(e)}")
     except Exception as e:
         print(f"An unexpected error occurred while checking {node_address}: {e}")
 
@@ -101,7 +104,8 @@ async def main():
     try:
         # Parse host and port configurations. SCAN_HOSTS supports either plain hosts
         # or host:port pairs. Plain hosts are combined with SCAN_PORTS.
-        raw_hosts = [h.strip() for h in config.SCAN_HOSTS.split(',') if h.strip()]
+        normalized_hosts = config.SCAN_HOSTS.replace(';', ',').replace(' ', ',')
+        raw_hosts = [h.strip() for h in normalized_hosts.split(',') if h.strip()]
         explicit_pairs = []  # list of (host, port)
         hosts_no_port = []
         for h in raw_hosts:
@@ -110,7 +114,9 @@ async def main():
                 explicit_pairs.append((host, int(port_str)))
             else:
                 hosts_no_port.append(h)
-        ports = [int(p.strip()) for p in config.SCAN_PORTS.split(',') if p.strip()]
+        
+        normalized_ports = config.SCAN_PORTS.replace(';', ',').replace(' ', ',')
+        ports = [int(p.strip()) for p in normalized_ports.split(',') if p.strip()]
 
         pairs = list(explicit_pairs)
         for h in hosts_no_port:

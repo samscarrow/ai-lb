@@ -162,17 +162,19 @@ class PowerOfTwoChoicesStrategy(RoutingStrategy):
                     if i == 0:
                         return buckets[i] * 0.5  # Assume uniform distribution in first bucket
                     
-                    lower_bound = buckets[i-1] if i > 0 else 0
+                    lower_bound = buckets[i-1]
                     upper_bound = buckets[i]
+                    prev_count = cumulative_counts[i-1]
+                    bucket_range = count - prev_count
                     
-                    if i < len(cumulative_counts) - 1:  # Not the infinity bucket
-                        prev_count = cumulative_counts[i-1] if i > 0 else 0
-                        bucket_range = count - prev_count
-                        if bucket_range > 0:
-                            position = (p95_target - prev_count) / bucket_range
-                            return lower_bound + position * (upper_bound - lower_bound)
+                    if upper_bound == float("inf"):
+                        return lower_bound * 1.1
+                        
+                    if bucket_range > 0:
+                        position = (p95_target - prev_count) / bucket_range
+                        return lower_bound + position * (upper_bound - lower_bound)
                     
-                    return upper_bound if upper_bound != float("inf") else 10.0
+                    return upper_bound
             
             return 0.0
             

@@ -1,50 +1,48 @@
 x-redis-env: &redis-env
-  REDIS_HOST: ${REDIS_HOST:-redis}
-  REDIS_PORT: ${REDIS_PORT:-6379}
+  REDIS_HOST: localhost
+  REDIS_PORT: 6379
 
 services:
   redis:
     image: "redis:alpine"
     container_name: ai_lb_redis
     restart: unless-stopped
+    network_mode: host
     volumes:
       - redis_data:/data
-    # Use default bridge network; other services reach via service name 'redis'
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    # Use host network so containers can reach via host.docker.internal
 
   # Monitor is optional; enabled via profile "full"
   monitor:
     build:
       context: ./monitor
     container_name: ai_lb_monitor
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-      - "pc-sam:host-gateway"
-      - "sams-macbook-pro:host-gateway"
-      - "macbook:host-gateway"
+    network_mode: host
     environment:
       <<: *redis-env
       # Hosts to scan for LMStudio or other upstreams
-      SCAN_HOSTS: ${SCAN_HOSTS:-}
-      SCAN_PORTS: ${SCAN_PORTS:-1234}
-      SCAN_INTERVAL: ${SCAN_INTERVAL:-60}
+      SCAN_HOSTS: ${SCAN_HOSTS:-localhost:11434,localhost:9996,localhost:9995}
+      SCAN_PORTS: ${SCAN_PORTS:-}
+      SCAN_INTERVAL: ${SCAN_INTERVAL:-10}
       # Optional concurrency caps for the LB's LEAST_LOADED strategy
-      DEFAULT_MAXCONN: ${DEFAULT_MAXCONN:-0}
+      DEFAULT_MAXCONN: ${DEFAULT_MAXCONN:-50}
       MAXCONN_MAP: ${MAXCONN_MAP:-}
     depends_on:
       - redis
     restart: unless-stopped
-    # No extra_hosts by default; prefer explicit FQDN/IPs in SCAN_HOSTS
     profiles: ["full"]
 
   load_balancer:
     build:
       context: ./load_balancer
     container_name: ai_lb_load_balancer
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-      - "pc-sam:host-gateway"
-      - "sams-macbook-pro:host-gateway"
-      - "macbook:host-gateway"
+    network_mode: host
     environment:
       <<: *redis-env
       # Routing/selection
@@ -76,9 +74,10 @@ services:
     depends_on:
       - redis
     restart: unless-stopped
-    ports:
-      - "${LOAD_BALANCER_PORT:-8000}:8000"
-    # No extra_hosts required for LB
+    command: ["uvicorn", "load_balancer.main:app", "--host", "0.0.0.0", "--port", "8001"]
+    # Port mapping not needed in host mode, app must bind to port directly
+    # ports:
+    #   - "${LOAD_BALANCER_PORT:-8000}:8000"
 
 volumes:
   redis_data:

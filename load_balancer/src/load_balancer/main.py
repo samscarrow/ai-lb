@@ -19,7 +19,21 @@ async def lifespan(app: FastAPI):
     global redis_client, http_client, router
     logger.info("Load balancer starting up...")
     if redis_client is None:
-        redis_client = redis.Redis(host=config.REDIS_HOST, port=config.REDIS_PORT, decode_responses=True)
+        # Create Redis client with reasonable timeouts
+        redis_client = redis.Redis(
+            host=config.REDIS_HOST,
+            port=config.REDIS_PORT,
+            decode_responses=True,
+            socket_connect_timeout=2,  # 2 second connection timeout
+            socket_timeout=5,  # 5 second socket timeout
+            retry_on_timeout=True,
+        )
+        # Try quick connection test, but don't block startup if it fails
+        try:
+            await asyncio.wait_for(redis_client.ping(), timeout=2.0)
+            logger.info("Successfully connected to Redis")
+        except Exception as e:
+            logger.warning(f"Redis not immediately available: {e}. Will retry in background...")
     if http_client is None:
         http_client = httpx.AsyncClient(timeout=httpx.Timeout(config.REQUEST_TIMEOUT_SECS))
     if router is None:
@@ -82,12 +96,14 @@ async def _series_p95(model: str, node: str) -> float:
             if count >= p95_target:
                 if i == 0:
                     return buckets[i] * 0.5
-                lower = buckets[i-1] if i > 0 else 0
+                lower = buckets[i-1]
                 upper = buckets[i]
-                prev = cumulative_counts[i-1] if i > 0 else 0
+                prev = cumulative_counts[i-1]
                 rng = max(1, count - prev)
                 pos = (p95_target - prev) / rng
-                return lower + pos * (upper - lower) if upper != float("inf") else 10.0
+                if upper == float("inf"):
+                    return lower * 1.1  # Slight bump if in inf bucket
+                return lower + pos * (upper - lower)
         return 0.0
     except Exception:
         return 0.0
@@ -568,8 +584,6 @@ async def _record_latency(model: str, node: str, elapsed_secs: float):
             if elapsed_secs <= le:
                 key = f"lb:latency_bucket:{series_key}:{le}"
                 await redis_client.incrby(key, 1)
-        # Always increment +Inf bucket explicitly (le == inf)
-        await redis_client.incrby(f"lb:latency_bucket:{series_key}:{float('inf')}", 1)
     except Exception:
         pass
 
@@ -582,7 +596,6 @@ async def _record_stream_ttfb(model: str, node: str, elapsed_secs: float):
         for le in _LAT_BUCKETS:
             if elapsed_secs <= le:
                 await redis_client.incrby(f"lb:stream_ttfb_bucket:{series_key}:{le}", 1)
-        await redis_client.incrby(f"lb:stream_ttfb_bucket:{series_key}:{float('inf')}", 1)
     except Exception:
         pass
 
@@ -595,7 +608,6 @@ async def _record_stream_duration(model: str, node: str, elapsed_secs: float):
         for le in _LAT_BUCKETS:
             if elapsed_secs <= le:
                 await redis_client.incrby(f"lb:stream_duration_bucket:{series_key}:{le}", 1)
-        await redis_client.incrby(f"lb:stream_duration_bucket:{series_key}:{float('inf')}", 1)
     except Exception:
         pass
 

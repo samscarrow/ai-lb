@@ -1,0 +1,33 @@
+import os
+
+import pytest
+
+httpx = pytest.importorskip("httpx")
+
+from agent.config import WorkerConfig
+from agent.tools.mcp_client import MCPToolRouter
+from agent.types import Task
+from agent.worker import Worker
+
+
+def test_worker_calls_lb_if_available() -> None:
+    lb_url = os.getenv("AI_LB_URL", "http://localhost:8000")
+    try:
+        resp = httpx.get(f"{lb_url}/v1/models", timeout=5.0)
+    except httpx.RequestError:
+        pytest.skip("AI-LB not reachable")
+    if resp.status_code != 200:
+        pytest.skip("AI-LB /v1/models not available")
+
+    data = resp.json()
+    models = [item.get("id") for item in data.get("data", []) if item.get("id")]
+    if not models:
+        pytest.skip("No models available on AI-LB")
+
+    config = WorkerConfig(lb_url=lb_url, model=models[0], max_turns=2, timeout_secs=30.0)
+    worker = Worker(config=config, tools=MCPToolRouter([]))
+    result = worker.run(Task(id="t1", description="Say 'ok'"))
+
+    assert result.success
+    assert result.output
+    assert result.lb_calls

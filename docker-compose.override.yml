@@ -1,16 +1,4 @@
 services:
-  node1:
-    build:
-      context: ./node_agent
-    container_name: ai_lb_node1
-    restart: unless-stopped
-    expose:
-      - "9999"
-  node2:
-    build:
-      context: ./node_agent
-    container_name: ai_lb_node2
-    restart: unless-stopped
-    expose:
-      - "9999"
-
+  monitor:
+    environment:
+      REDIS_HOST: localhost
