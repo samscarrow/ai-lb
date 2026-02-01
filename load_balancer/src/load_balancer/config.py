@@ -152,3 +152,28 @@ BACKEND_ALIASES = _parse_backend_aliases(os.getenv("BACKEND_ALIASES", ""))
 
 # Reverse mapping: host:port -> alias (for display purposes)
 BACKEND_ALIASES_REVERSE = {v: k for k, v in BACKEND_ALIASES.items()}
+
+# Model equivalence groups for multi-backend consensus
+# Format: "canonical=model1,model2,model3;another=modelA,modelB"
+# Example: "qwen2.5-instruct=qwen2.5-7b-instruct-mlx@4bit,qwen2.5:7b-instruct,qwen2.5-7b-instruct:latest"
+# When requesting "qwen2.5-instruct", backends with any of the listed models are eligible
+def _parse_model_equivalents(s: str) -> dict:
+    """Parse MODEL_EQUIVALENTS into {canonical: [model1, model2, ...]}."""
+    mapping = {}
+    for group in [g.strip() for g in s.split(";") if g.strip()]:
+        if "=" not in group:
+            continue
+        canonical, models = group.split("=", 1)
+        canonical = canonical.strip()
+        model_list = [m.strip() for m in models.split(",") if m.strip()]
+        if canonical and model_list:
+            mapping[canonical] = model_list
+    return mapping
+
+MODEL_EQUIVALENTS = _parse_model_equivalents(os.getenv("MODEL_EQUIVALENTS", ""))
+
+# Build reverse lookup: model_name -> canonical name
+MODEL_EQUIVALENTS_REVERSE = {}
+for canonical, models in MODEL_EQUIVALENTS.items():
+    for m in models:
+        MODEL_EQUIVALENTS_REVERSE[m] = canonical

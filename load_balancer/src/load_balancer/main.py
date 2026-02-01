@@ -638,6 +638,78 @@ def _get_backend_alias(host_port: str) -> Optional[str]:
     return reverse.get(host_port)
 
 
+def _get_equivalent_models(model_name: str) -> List[str]:
+    """Get all equivalent model names for a given model.
+
+    If model_name is a canonical name in MODEL_EQUIVALENTS, returns the list.
+    If model_name is in MODEL_EQUIVALENTS_REVERSE, returns all equivalents for that group.
+    Otherwise returns [model_name].
+    """
+    equivalents = getattr(config, "MODEL_EQUIVALENTS", {}) or {}
+    reverse = getattr(config, "MODEL_EQUIVALENTS_REVERSE", {}) or {}
+
+    # Check if it's a canonical name
+    if model_name in equivalents:
+        return equivalents[model_name]
+
+    # Check if it's in an equivalence group
+    if model_name in reverse:
+        canonical = reverse[model_name]
+        return equivalents.get(canonical, [model_name])
+
+    return [model_name]
+
+
+async def _get_backend_model(backend: str, requested_model: str) -> Optional[str]:
+    """Find which model name a backend actually has that matches the requested model.
+
+    Returns the actual model ID to use for this backend, or None if no match.
+    """
+    equivalent_models = _get_equivalent_models(requested_model)
+
+    try:
+        models_json = await redis_client.get(f"node:{backend}:models")
+        if not models_json:
+            return None
+        models = json.loads(models_json).get("data", [])
+        backend_model_ids = {m.get("id") for m in models if m.get("id")}
+
+        # Check for exact match first
+        if requested_model in backend_model_ids:
+            return requested_model
+
+        # Check for equivalent matches
+        for equiv in equivalent_models:
+            if equiv in backend_model_ids:
+                return equiv
+
+        return None
+    except Exception:
+        return None
+
+
+async def _get_eligible_nodes_for_equivalents(model_name: str) -> List[str]:
+    """Get eligible nodes that have the requested model OR any equivalent model."""
+    equivalent_models = _get_equivalent_models(model_name)
+
+    # If no equivalents defined, use standard eligibility
+    if len(equivalent_models) <= 1 and model_name not in getattr(config, "MODEL_EQUIVALENTS", {}):
+        return await get_eligible_nodes(model_name)
+
+    # Gather eligible nodes for all equivalent models
+    all_eligible = set()
+    for equiv_model in equivalent_models:
+        nodes = await get_eligible_nodes(equiv_model)
+        all_eligible.update(nodes)
+
+    # Also check the canonical name if different
+    if model_name not in equivalent_models:
+        nodes = await get_eligible_nodes(model_name)
+        all_eligible.update(nodes)
+
+    return list(all_eligible)
+
+
 async def _select_backends_for_execution(
     exec_config: ExecutionConfig,
     model_name: str,
@@ -677,7 +749,8 @@ async def _make_backend_request(
     headers: Dict[str, str],
     model_name: str,
     request_id: str,
-    start_time: float
+    start_time: float,
+    backend_model_override: Optional[str] = None
 ) -> BackendResult:
     """Make a single non-streaming request to a backend and return result."""
     url = f"http://{backend}/v1/chat/completions"
@@ -685,13 +758,19 @@ async def _make_backend_request(
     result = BackendResult(backend=backend, alias=alias)
     t0 = time.monotonic()
 
+    # Use override model if provided (for model equivalence support)
+    actual_model = backend_model_override or model_name
+    request_body = dict(body)
+    if backend_model_override:
+        request_body["model"] = backend_model_override
+
     acquired = await _acquire_slot(backend)
     if not acquired:
         result.error = "Backend at capacity"
         result.latency_ms = (time.monotonic() - t0) * 1000
         return result
 
-    model_ok = await _acquire_model_slot(model_name)
+    model_ok = await _acquire_model_slot(actual_model)
     if not model_ok:
         await _dec_inflight(backend)
         result.error = "Model at capacity"
@@ -700,7 +779,7 @@ async def _make_backend_request(
 
     try:
         try:
-            resp = await http_client.post(url, json=body, headers=headers)
+            resp = await http_client.post(url, json=request_body, headers=headers)
             result.status_code = resp.status_code
             result.first_byte_ms = (time.monotonic() - t0) * 1000
 
@@ -716,7 +795,7 @@ async def _make_backend_request(
                     result.response_body = {"raw": resp.text}
         except AttributeError:
             # Compatibility for test fakes that only implement .stream()
-            async with http_client.stream("POST", url, json=body, headers=headers) as response:
+            async with http_client.stream("POST", url, json=request_body, headers=headers) as response:
                 result.status_code = getattr(response, "status_code", 200)
                 result.first_byte_ms = (time.monotonic() - t0) * 1000
 
@@ -781,15 +860,31 @@ async def _handle_multi_backend_execution(
     }
     headers["x-request-id"] = request_id
 
+    # Expand eligible nodes to include those with equivalent models
+    expanded_eligible = await _get_eligible_nodes_for_equivalents(model_name)
+    if expanded_eligible:
+        # Merge with original eligible_nodes (union)
+        all_eligible = list(set(eligible_nodes) | set(expanded_eligible))
+    else:
+        all_eligible = eligible_nodes
+
     # Select backends
-    backends = await _select_backends_for_execution(exec_config, model_name, eligible_nodes)
+    backends = await _select_backends_for_execution(exec_config, model_name, all_eligible)
     if not backends:
         raise HTTPException(status_code=404, detail="No eligible backends for multi-exec")
 
-    # Create request factory
+    # Build mapping of backend -> actual model name to use
+    backend_models: Dict[str, str] = {}
+    for backend in backends:
+        actual_model = await _get_backend_model(backend, model_name)
+        backend_models[backend] = actual_model or model_name
+
+    # Create request factory with per-backend model override
     async def make_request(backend: str) -> BackendResult:
+        backend_model = backend_models.get(backend, model_name)
         return await _make_backend_request(
-            backend, body, headers, model_name, request_id, start_time
+            backend, body, headers, model_name, request_id, start_time,
+            backend_model_override=backend_model if backend_model != model_name else None
         )
 
     engine = ExecutionEngine(
@@ -1052,13 +1147,19 @@ async def chat_completions(request: Request):
                     body["model"] = fb_model
                     model_name = fb_model
                     eligible_nodes = fb_nodes
-    if not eligible_nodes:
-        raise HTTPException(status_code=404, detail=f"No healthy nodes found for model '{model_name}'.")
-
     request_id = request.headers.get("x-request-id") or str(uuid.uuid4())
 
     # Check for multi-backend execution mode
     exec_config = _parse_execution_mode(request)
+
+    # For multi-exec, try model equivalents if no direct match
+    if not eligible_nodes and exec_config:
+        equiv_nodes = await _get_eligible_nodes_for_equivalents(model_name)
+        if equiv_nodes:
+            eligible_nodes = equiv_nodes
+
+    if not eligible_nodes:
+        raise HTTPException(status_code=404, detail=f"No healthy nodes found for model '{model_name}'.")
     if exec_config:
         return await _handle_multi_backend_execution(
             request=request,

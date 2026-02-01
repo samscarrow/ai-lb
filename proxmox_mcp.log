@@ -1022,3 +1022,87 @@
 2026-01-31 19:48:49,371 - mcp.server.fastmcp.resources.resource_manager - DEBUG - Listing resources
 2026-01-31 19:48:49,371 - mcp.server.lowlevel.server - DEBUG - Response sent
 2026-01-31 19:48:49,372 - mcp.server.lowlevel.server - DEBUG - Response sent
+2026-02-01 00:13:40,884 - proxmox-mcp.proxmox - INFO - Connecting to Proxmox host: 10.10.30.4
+2026-02-01 00:13:40,912 - urllib3.connectionpool - DEBUG - Starting new HTTPS connection (1): 10.10.30.4:8006
+2026-02-01 00:13:40,917 - urllib3.connectionpool - DEBUG - https://10.10.30.4:8006 "GET /api2/json/version HTTP/1.1" 200 72
+2026-02-01 00:13:40,917 - proxmox-mcp.proxmox - INFO - Successfully connected to Proxmox API
+2026-02-01 00:13:40,919 - mcp.server.lowlevel.server - DEBUG - Initializing server 'ProxmoxMCP'
+2026-02-01 00:13:40,919 - mcp.server.lowlevel.server - DEBUG - Registering handler for ListToolsRequest
+2026-02-01 00:13:40,919 - mcp.server.lowlevel.server - DEBUG - Registering handler for CallToolRequest
+2026-02-01 00:13:40,919 - mcp.server.lowlevel.server - DEBUG - Registering handler for ListResourcesRequest
+2026-02-01 00:13:40,919 - mcp.server.lowlevel.server - DEBUG - Registering handler for ReadResourceRequest
+2026-02-01 00:13:40,919 - mcp.server.lowlevel.server - DEBUG - Registering handler for PromptListRequest
+2026-02-01 00:13:40,919 - mcp.server.lowlevel.server - DEBUG - Registering handler for GetPromptRequest
+2026-02-01 00:13:40,919 - mcp.server.lowlevel.server - DEBUG - Registering handler for ListResourceTemplatesRequest
+2026-02-01 00:13:40,964 - proxmox-mcp - INFO - Starting MCP server...
+2026-02-01 00:13:40,967 - asyncio - DEBUG - Using selector: EpollSelector
+2026-02-01 00:13:40,980 - mcp.server.lowlevel.server - DEBUG - Received message: root=InitializedNotification(method='notifications/initialized', params=None, jsonrpc='2.0')
+2026-02-01 00:13:40,981 - mcp.server.lowlevel.server - DEBUG - Received message: <mcp.shared.session.RequestResponder object at 0x7fc55b323110>
+2026-02-01 00:13:40,981 - mcp.server.lowlevel.server - INFO - Processing request of type ListToolsRequest
+2026-02-01 00:13:40,981 - mcp.server.lowlevel.server - DEBUG - Dispatching request of type ListToolsRequest
+2026-02-01 00:13:40,982 - mcp.server.lowlevel.server - DEBUG - Response sent
+2026-02-01 00:13:40,983 - mcp.server.lowlevel.server - DEBUG - Received message: <mcp.shared.session.RequestResponder object at 0x7fc55b322990>
+2026-02-01 00:13:40,983 - mcp.server.lowlevel.server - INFO - Processing request of type ListPromptsRequest
+2026-02-01 00:13:40,983 - mcp.server.lowlevel.server - DEBUG - Dispatching request of type ListPromptsRequest
+2026-02-01 00:13:40,984 - mcp.server.lowlevel.server - DEBUG - Received message: <mcp.shared.session.RequestResponder object at 0x7fc55b2e4fc0>
+2026-02-01 00:13:40,984 - mcp.server.lowlevel.server - INFO - Processing request of type ListResourcesRequest
+2026-02-01 00:13:40,984 - mcp.server.lowlevel.server - DEBUG - Dispatching request of type ListResourcesRequest
+2026-02-01 00:13:40,984 - mcp.server.fastmcp.resources.resource_manager - DEBUG - Listing resources
+2026-02-01 00:13:40,984 - mcp.server.lowlevel.server - DEBUG - Response sent
+2026-02-01 00:13:40,985 - mcp.server.lowlevel.server - DEBUG - Response sent
+2026-02-01 00:13:48,580 - proxmox-mcp.proxmox - INFO - Connecting to Proxmox host: 10.10.30.4
+2026-02-01 00:13:48,597 - urllib3.connectionpool - DEBUG - Starting new HTTPS connection (1): 10.10.30.4:8006
+2026-02-01 00:13:48,605 - urllib3.connectionpool - DEBUG - https://10.10.30.4:8006 "GET /api2/json/version HTTP/1.1" 200 72
+2026-02-01 00:13:48,605 - proxmox-mcp.proxmox - INFO - Successfully connected to Proxmox API
+2026-02-01 00:13:48,607 - mcp.server.lowlevel.server - DEBUG - Initializing server 'ProxmoxMCP'
+2026-02-01 00:13:48,607 - mcp.server.lowlevel.server - DEBUG - Registering handler for ListToolsRequest
+2026-02-01 00:13:48,607 - mcp.server.lowlevel.server - DEBUG - Registering handler for CallToolRequest
+2026-02-01 00:13:48,607 - mcp.server.lowlevel.server - DEBUG - Registering handler for ListResourcesRequest
+2026-02-01 00:13:48,607 - mcp.server.lowlevel.server - DEBUG - Registering handler for ReadResourceRequest
+2026-02-01 00:13:48,607 - mcp.server.lowlevel.server - DEBUG - Registering handler for PromptListRequest
+2026-02-01 00:13:48,607 - mcp.server.lowlevel.server - DEBUG - Registering handler for GetPromptRequest
+2026-02-01 00:13:48,607 - mcp.server.lowlevel.server - DEBUG - Registering handler for ListResourceTemplatesRequest
+2026-02-01 00:13:48,634 - proxmox-mcp - INFO - Starting MCP server...
+2026-02-01 00:13:48,637 - asyncio - DEBUG - Using selector: EpollSelector
+2026-02-01 00:13:48,660 - mcp.server.lowlevel.server - DEBUG - Received message: root=InitializedNotification(method='notifications/initialized', params=None, jsonrpc='2.0')
+2026-02-01 00:13:48,661 - mcp.server.lowlevel.server - DEBUG - Received message: <mcp.shared.session.RequestResponder object at 0x7f089f5ff110>
+2026-02-01 00:13:48,661 - mcp.server.lowlevel.server - INFO - Processing request of type ListToolsRequest
+2026-02-01 00:13:48,662 - mcp.server.lowlevel.server - DEBUG - Dispatching request of type ListToolsRequest
+2026-02-01 00:13:48,663 - mcp.server.lowlevel.server - DEBUG - Response sent
+2026-02-01 00:13:48,665 - mcp.server.lowlevel.server - DEBUG - Received message: <mcp.shared.session.RequestResponder object at 0x7f089f5fe990>
+2026-02-01 00:13:48,665 - mcp.server.lowlevel.server - INFO - Processing request of type ListPromptsRequest
+2026-02-01 00:13:48,665 - mcp.server.lowlevel.server - DEBUG - Dispatching request of type ListPromptsRequest
+2026-02-01 00:13:48,665 - mcp.server.lowlevel.server - DEBUG - Received message: <mcp.shared.session.RequestResponder object at 0x7f089f5c0fc0>
+2026-02-01 00:13:48,665 - mcp.server.lowlevel.server - INFO - Processing request of type ListResourcesRequest
+2026-02-01 00:13:48,665 - mcp.server.lowlevel.server - DEBUG - Dispatching request of type ListResourcesRequest
+2026-02-01 00:13:48,665 - mcp.server.fastmcp.resources.resource_manager - DEBUG - Listing resources
+2026-02-01 00:13:48,666 - mcp.server.lowlevel.server - DEBUG - Response sent
+2026-02-01 00:13:48,667 - mcp.server.lowlevel.server - DEBUG - Response sent
+2026-02-01 00:17:36,936 - proxmox-mcp.proxmox - INFO - Connecting to Proxmox host: 10.10.30.4
+2026-02-01 00:17:36,975 - urllib3.connectionpool - DEBUG - Starting new HTTPS connection (1): 10.10.30.4:8006
+2026-02-01 00:17:36,986 - urllib3.connectionpool - DEBUG - https://10.10.30.4:8006 "GET /api2/json/version HTTP/1.1" 200 72
+2026-02-01 00:17:36,986 - proxmox-mcp.proxmox - INFO - Successfully connected to Proxmox API
+2026-02-01 00:17:36,988 - mcp.server.lowlevel.server - DEBUG - Initializing server 'ProxmoxMCP'
+2026-02-01 00:17:36,989 - mcp.server.lowlevel.server - DEBUG - Registering handler for ListToolsRequest
+2026-02-01 00:17:36,989 - mcp.server.lowlevel.server - DEBUG - Registering handler for CallToolRequest
+2026-02-01 00:17:36,989 - mcp.server.lowlevel.server - DEBUG - Registering handler for ListResourcesRequest
+2026-02-01 00:17:36,989 - mcp.server.lowlevel.server - DEBUG - Registering handler for ReadResourceRequest
+2026-02-01 00:17:36,989 - mcp.server.lowlevel.server - DEBUG - Registering handler for PromptListRequest
+2026-02-01 00:17:36,989 - mcp.server.lowlevel.server - DEBUG - Registering handler for GetPromptRequest
+2026-02-01 00:17:36,989 - mcp.server.lowlevel.server - DEBUG - Registering handler for ListResourceTemplatesRequest
+2026-02-01 00:17:37,054 - proxmox-mcp - INFO - Starting MCP server...
+2026-02-01 00:17:37,059 - asyncio - DEBUG - Using selector: EpollSelector
+2026-02-01 00:17:37,066 - mcp.server.lowlevel.server - DEBUG - Received message: root=InitializedNotification(method='notifications/initialized', params=None, jsonrpc='2.0')
+2026-02-01 00:17:37,067 - mcp.server.lowlevel.server - DEBUG - Received message: <mcp.shared.session.RequestResponder object at 0x7f0f2e68f110>
+2026-02-01 00:17:37,067 - mcp.server.lowlevel.server - INFO - Processing request of type ListToolsRequest
+2026-02-01 00:17:37,067 - mcp.server.lowlevel.server - DEBUG - Dispatching request of type ListToolsRequest
+2026-02-01 00:17:37,068 - mcp.server.lowlevel.server - DEBUG - Response sent
+2026-02-01 00:17:37,069 - mcp.server.lowlevel.server - DEBUG - Received message: <mcp.shared.session.RequestResponder object at 0x7f0f2e68e990>
+2026-02-01 00:17:37,069 - mcp.server.lowlevel.server - INFO - Processing request of type ListPromptsRequest
+2026-02-01 00:17:37,069 - mcp.server.lowlevel.server - DEBUG - Dispatching request of type ListPromptsRequest
+2026-02-01 00:17:37,070 - mcp.server.lowlevel.server - DEBUG - Received message: <mcp.shared.session.RequestResponder object at 0x7f0f2e650fc0>
+2026-02-01 00:17:37,070 - mcp.server.lowlevel.server - INFO - Processing request of type ListResourcesRequest
+2026-02-01 00:17:37,070 - mcp.server.lowlevel.server - DEBUG - Dispatching request of type ListResourcesRequest
+2026-02-01 00:17:37,070 - mcp.server.fastmcp.resources.resource_manager - DEBUG - Listing resources
+2026-02-01 00:17:37,070 - mcp.server.lowlevel.server - DEBUG - Response sent
+2026-02-01 00:17:37,071 - mcp.server.lowlevel.server - DEBUG - Response sent
