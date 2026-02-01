@@ -123,3 +123,32 @@ ON_DEMAND_WARM_TIMEOUT_SECS = int(os.getenv("ON_DEMAND_WARM_TIMEOUT_SECS", 30))
 ON_DEMAND_WARM_GRACE_SECS = int(os.getenv("ON_DEMAND_WARM_GRACE_SECS", 30))
 ON_DEMAND_WARM_POLL_MS = int(os.getenv("ON_DEMAND_WARM_POLL_MS", 750))
 ON_DEMAND_WARM_FANOUT = int(os.getenv("ON_DEMAND_WARM_FANOUT", 2))  # probe up to N healthy nodes concurrently
+
+# Multi-backend execution configuration
+# Enables parallel/sequential execution across multiple API endpoints
+MULTI_EXEC_ENABLED = os.getenv("MULTI_EXEC_ENABLED", "true").lower() in ("1", "true", "yes")
+MULTI_EXEC_MAX_BACKENDS = int(os.getenv("MULTI_EXEC_MAX_BACKENDS", 3))
+MULTI_EXEC_TIMEOUT_SECS = float(os.getenv("MULTI_EXEC_TIMEOUT_SECS", 60.0))
+# Consensus similarity threshold for text responses (0.0-1.0)
+MULTI_EXEC_CONSENSUS_THRESHOLD = float(os.getenv("MULTI_EXEC_CONSENSUS_THRESHOLD", 0.9))
+
+# Backend aliases for human-friendly names
+# Format: "alias1=host1:port1,alias2=host2:port2" or "alias1=host1:port1;alias2=host2:port2"
+# Example: "m2=macbook-m2.local:1234,m4=macbook-m4.scarrow.tailnet:1234,gentoo=localhost:11434"
+def _parse_backend_aliases(s: str) -> dict:
+    """Parse BACKEND_ALIASES env var into {alias: host:port} mapping."""
+    mapping = {}
+    for part in [p.strip() for p in s.replace(";", ",").split(",") if p.strip()]:
+        if "=" not in part:
+            continue
+        alias, target = part.split("=", 1)
+        alias = alias.strip()
+        target = target.strip()
+        if alias and target:
+            mapping[alias] = target
+    return mapping
+
+BACKEND_ALIASES = _parse_backend_aliases(os.getenv("BACKEND_ALIASES", ""))
+
+# Reverse mapping: host:port -> alias (for display purposes)
+BACKEND_ALIASES_REVERSE = {v: k for k, v in BACKEND_ALIASES.items()}

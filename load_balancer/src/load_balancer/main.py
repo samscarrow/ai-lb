@@ -1,11 +1,12 @@
 import httpx
+import random
 import redis.asyncio as redis
 import json
 import logging
 import time
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 from fastapi import FastAPI, Request, Response, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 import uuid
 import asyncio
 from contextlib import asynccontextmanager
@@ -13,6 +14,13 @@ from contextlib import asynccontextmanager
 from . import config
 from .request_validation import sanitize_chat_request, sanitize_embeddings_request
 from .routing.strategies import get_routing_strategy
+from .execution import (
+    ExecutionMode,
+    ExecutionConfig,
+    BackendResult,
+    ConsensusResult,
+    ExecutionEngine,
+)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -555,6 +563,363 @@ async def _set_sticky_node(session_id: Optional[str], model_name: str, node: str
     except Exception:
         pass
 
+
+# ---------------------- Multi-Backend Execution Helpers ----------------------
+
+
+def _parse_execution_mode(request: Request) -> Optional[ExecutionConfig]:
+    """Parse execution mode from request headers or query params.
+
+    Headers (preferred):
+        X-Execution-Mode: race | all | sequence | consensus
+        X-Target-Backends: alias1,alias2,... (optional)
+        X-Max-Backends: N (optional, default 3)
+
+    Query params (fallback):
+        ?mode=race|all|sequence|consensus
+        &backends=alias1,alias2,...
+        &max_backends=N
+    """
+    if not getattr(config, "MULTI_EXEC_ENABLED", True):
+        return None
+
+    # Check header first, then query param
+    mode_str = request.headers.get("x-execution-mode") or request.query_params.get("mode")
+    if not mode_str:
+        return None
+
+    mode_str = mode_str.lower().strip()
+    try:
+        mode = ExecutionMode(mode_str)
+    except ValueError:
+        return None
+
+    # Parse target backends
+    targets_str = request.headers.get("x-target-backends") or request.query_params.get("backends")
+    target_backends = None
+    if targets_str:
+        target_backends = [t.strip() for t in targets_str.split(",") if t.strip()]
+
+    # Parse max backends
+    max_str = request.headers.get("x-max-backends") or request.query_params.get("max_backends")
+    max_backends = int(getattr(config, "MULTI_EXEC_MAX_BACKENDS", 3))
+    if max_str:
+        try:
+            max_backends = int(max_str)
+        except ValueError:
+            pass
+
+    # Parse timeout
+    timeout_str = request.headers.get("x-execution-timeout")
+    timeout_secs = float(getattr(config, "MULTI_EXEC_TIMEOUT_SECS", 60.0))
+    if timeout_str:
+        try:
+            timeout_secs = float(timeout_str)
+        except ValueError:
+            pass
+
+    return ExecutionConfig(
+        mode=mode,
+        target_backends=target_backends,
+        max_backends=max_backends,
+        timeout_secs=timeout_secs
+    )
+
+
+def _resolve_backend_alias(alias_or_host: str) -> str:
+    """Resolve a backend alias to host:port, or return as-is if not an alias."""
+    aliases = getattr(config, "BACKEND_ALIASES", {}) or {}
+    return aliases.get(alias_or_host, alias_or_host)
+
+
+def _get_backend_alias(host_port: str) -> Optional[str]:
+    """Get human-friendly alias for a host:port, or None if not aliased."""
+    reverse = getattr(config, "BACKEND_ALIASES_REVERSE", {}) or {}
+    return reverse.get(host_port)
+
+
+async def _select_backends_for_execution(
+    exec_config: ExecutionConfig,
+    model_name: str,
+    eligible_nodes: List[str]
+) -> List[str]:
+    """Select backends for multi-exec based on config.
+
+    If target_backends specified, resolve aliases and filter to eligible.
+    Otherwise, select up to max_backends from eligible pool.
+    """
+    if exec_config.target_backends:
+        # Resolve aliases and filter to eligible
+        resolved = [_resolve_backend_alias(t) for t in exec_config.target_backends]
+        # Keep order but filter to eligible
+        return [b for b in resolved if b in eligible_nodes][:exec_config.max_backends]
+
+    # Auto-select from eligible pool
+    # Use router to select diverse backends
+    selected = []
+    pool = list(eligible_nodes)
+
+    for _ in range(min(exec_config.max_backends, len(pool))):
+        if not pool:
+            break
+        # Use router to pick best candidate from remaining pool
+        candidate = await router.select_node(pool, model_name, redis_client)
+        if candidate:
+            selected.append(candidate)
+            pool.remove(candidate)
+
+    return selected
+
+
+async def _make_backend_request(
+    backend: str,
+    body: Dict[str, Any],
+    headers: Dict[str, str],
+    model_name: str,
+    request_id: str,
+    start_time: float
+) -> BackendResult:
+    """Make a single non-streaming request to a backend and return result."""
+    url = f"http://{backend}/v1/chat/completions"
+    alias = _get_backend_alias(backend)
+    result = BackendResult(backend=backend, alias=alias)
+    t0 = time.monotonic()
+
+    acquired = await _acquire_slot(backend)
+    if not acquired:
+        result.error = "Backend at capacity"
+        result.latency_ms = (time.monotonic() - t0) * 1000
+        return result
+
+    model_ok = await _acquire_model_slot(model_name)
+    if not model_ok:
+        await _dec_inflight(backend)
+        result.error = "Model at capacity"
+        result.latency_ms = (time.monotonic() - t0) * 1000
+        return result
+
+    try:
+        try:
+            resp = await http_client.post(url, json=body, headers=headers)
+            result.status_code = resp.status_code
+            result.first_byte_ms = (time.monotonic() - t0) * 1000
+
+            if resp.status_code >= 500 or resp.status_code == 404:
+                await _record_failure(backend)
+                result.error = f"HTTP {resp.status_code}"
+            else:
+                await _record_success(backend)
+                result.success = True
+                try:
+                    result.response_body = resp.json()
+                except Exception:
+                    result.response_body = {"raw": resp.text}
+        except AttributeError:
+            # Compatibility for test fakes that only implement .stream()
+            async with http_client.stream("POST", url, json=body, headers=headers) as response:
+                result.status_code = getattr(response, "status_code", 200)
+                result.first_byte_ms = (time.monotonic() - t0) * 1000
+
+                if result.status_code >= 500 or result.status_code == 404:
+                    await _record_failure(backend)
+                    result.error = f"HTTP {result.status_code}"
+                else:
+                    chunks = bytearray()
+                    async for chunk in response.aiter_bytes():
+                        chunks.extend(chunk)
+                    await _record_success(backend)
+                    result.success = True
+                    try:
+                        result.response_body = json.loads(bytes(chunks))
+                    except Exception:
+                        result.response_body = {"raw": bytes(chunks).decode(errors="replace")}
+
+    except httpx.RequestError as e:
+        await _record_failure(backend)
+        result.error = str(e)
+    except Exception as e:
+        await _record_failure(backend)
+        result.error = str(e)
+    finally:
+        await _dec_inflight(backend)
+        await _dec_model(model_name)
+        result.latency_ms = (time.monotonic() - t0) * 1000
+
+    return result
+
+
+async def _record_multi_exec_metrics(mode: str, backends_attempted: int, backends_succeeded: int):
+    """Record metrics for multi-backend execution."""
+    try:
+        await redis_client.incrby(f"lb:multi_exec_total:{mode}", 1)
+        await redis_client.incrby("lb:multi_exec_total", 1)
+        await redis_client.incrby(f"lb:multi_exec_backends_sum:{mode}", backends_attempted)
+        await redis_client.incrby(f"lb:multi_exec_backends_count:{mode}", 1)
+        await redis_client.incrby(f"lb:multi_exec_succeeded_sum:{mode}", backends_succeeded)
+    except Exception:
+        pass
+
+
+async def _handle_multi_backend_execution(
+    request: Request,
+    body: Dict[str, Any],
+    exec_config: ExecutionConfig,
+    model_name: str,
+    eligible_nodes: List[str],
+    request_id: str,
+    start_time: float,
+    is_stream: bool,
+    on_demand_wait: bool,
+    warm_wait_ms: int,
+    model_defaulted: bool
+) -> Response:
+    """Handle multi-backend execution modes (race, all, sequence, consensus)."""
+    headers = {
+        key: value
+        for key, value in request.headers.items()
+        if key.lower() not in ('host', 'content-length', 'x-execution-mode', 'x-target-backends', 'x-max-backends')
+    }
+    headers["x-request-id"] = request_id
+
+    # Select backends
+    backends = await _select_backends_for_execution(exec_config, model_name, eligible_nodes)
+    if not backends:
+        raise HTTPException(status_code=404, detail="No eligible backends for multi-exec")
+
+    # Create request factory
+    async def make_request(backend: str) -> BackendResult:
+        return await _make_backend_request(
+            backend, body, headers, model_name, request_id, start_time
+        )
+
+    engine = ExecutionEngine(
+        similarity_threshold=float(getattr(config, "MULTI_EXEC_CONSENSUS_THRESHOLD", 0.9))
+    )
+
+    await _inc_requests_total()
+
+    # Non-streaming multi-exec
+    if exec_config.mode == ExecutionMode.RACE:
+        result = await engine.execute_race(backends, make_request, exec_config.timeout_secs)
+        await _record_multi_exec_metrics("race", len(backends), 1 if result.success else 0)
+
+        if not result.success:
+            raise HTTPException(status_code=502, detail=result.error or "All backends failed")
+
+        resp_body = result.response_body or {}
+        out = JSONResponse(content=resp_body)
+
+    elif exec_config.mode == ExecutionMode.ALL:
+        results = await engine.execute_all(backends, make_request, exec_config.timeout_secs)
+        succeeded = sum(1 for r in results if r.success)
+        await _record_multi_exec_metrics("all", len(backends), succeeded)
+
+        # Build response with all results
+        resp_body = {
+            "mode": "all",
+            "backends_attempted": len(backends),
+            "backends_succeeded": succeeded,
+            "responses": [
+                {
+                    "backend": r.backend,
+                    "alias": r.alias,
+                    "success": r.success,
+                    "latency_ms": r.latency_ms,
+                    "error": r.error,
+                    "response": r.response_body
+                }
+                for r in results
+            ]
+        }
+        out = JSONResponse(content=resp_body)
+
+    elif exec_config.mode == ExecutionMode.SEQUENCE:
+        results = await engine.execute_sequence(backends, make_request, exec_config.timeout_secs, stop_on_success=False)
+        succeeded = sum(1 for r in results if r.success)
+        await _record_multi_exec_metrics("sequence", len(results), succeeded)
+
+        resp_body = {
+            "mode": "sequence",
+            "backends_attempted": len(results),
+            "backends_succeeded": succeeded,
+            "responses": [
+                {
+                    "backend": r.backend,
+                    "alias": r.alias,
+                    "success": r.success,
+                    "latency_ms": r.latency_ms,
+                    "error": r.error,
+                    "response": r.response_body
+                }
+                for r in results
+            ]
+        }
+        out = JSONResponse(content=resp_body)
+
+    elif exec_config.mode == ExecutionMode.CONSENSUS:
+        consensus = await engine.execute_consensus(backends, make_request, exec_config.timeout_secs)
+        succeeded = sum(1 for r in consensus.all_responses if r.success)
+        await _record_multi_exec_metrics("consensus", len(backends), succeeded)
+
+        # Build consensus response
+        resp_body = {
+            "mode": "consensus",
+            "winner": {
+                "backend": consensus.winner.backend,
+                "alias": consensus.winner.alias,
+                "response": consensus.winner.response_body,
+                "latency_ms": consensus.winner.latency_ms
+            },
+            "agreement_count": consensus.agreement_count,
+            "disagreement": consensus.disagreement,
+            "comparison_type": consensus.comparison_type,
+            "all_responses": [
+                {
+                    "backend": r.backend,
+                    "alias": r.alias,
+                    "success": r.success,
+                    "latency_ms": r.latency_ms,
+                    "error": r.error,
+                    "response": r.response_body
+                }
+                for r in consensus.all_responses
+            ]
+        }
+        out = JSONResponse(content=resp_body)
+        # Add disagreement header
+        if consensus.disagreement:
+            out.headers["x-disagreement"] = "true"
+
+    else:
+        raise HTTPException(status_code=400, detail=f"Unknown execution mode: {exec_config.mode}")
+
+    # Common headers
+    out.headers["x-execution-mode"] = exec_config.mode.value
+    out.headers["x-backends-attempted"] = ",".join(backends)
+    out.headers["x-backends-count"] = str(len(backends))
+    out.headers["x-selected-model"] = model_name
+    out.headers["x-request-id"] = request_id
+    out.headers["x-on-demand-wait"] = "true" if on_demand_wait else "false"
+    out.headers["x-warm-wait-ms"] = str(warm_wait_ms)
+    out.headers["x-model-defaulted"] = "true" if model_defaulted else "false"
+
+    # Find fastest backend
+    if exec_config.mode in (ExecutionMode.ALL, ExecutionMode.SEQUENCE, ExecutionMode.CONSENSUS):
+        try:
+            if exec_config.mode == ExecutionMode.CONSENSUS:
+                all_results = consensus.all_responses
+            else:
+                all_results = results
+            successful = [r for r in all_results if r.success]
+            if successful:
+                fastest = min(successful, key=lambda r: r.latency_ms)
+                out.headers["x-fastest-backend"] = fastest.alias or fastest.backend
+        except Exception:
+            pass
+
+    return out
+
+
 @app.get("/v1/models")
 async def get_all_models():
     """Aggregates and de-duplicates model lists from all healthy nodes."""
@@ -690,8 +1055,27 @@ async def chat_completions(request: Request):
     if not eligible_nodes:
         raise HTTPException(status_code=404, detail=f"No healthy nodes found for model '{model_name}'.")
 
-    headers = {key: value for key, value in request.headers.items() if key.lower() not in ('host', 'content-length')}
     request_id = request.headers.get("x-request-id") or str(uuid.uuid4())
+
+    # Check for multi-backend execution mode
+    exec_config = _parse_execution_mode(request)
+    if exec_config:
+        return await _handle_multi_backend_execution(
+            request=request,
+            body=body,
+            exec_config=exec_config,
+            model_name=model_name,
+            eligible_nodes=eligible_nodes,
+            request_id=request_id,
+            start_time=start_time,
+            is_stream=is_stream,
+            on_demand_wait=on_demand_wait,
+            warm_wait_ms=warm_wait_ms,
+            model_defaulted=model_defaulted
+        )
+
+    # Standard single-backend path continues below
+    headers = {key: value for key, value in request.headers.items() if key.lower() not in ('host', 'content-length')}
     headers["x-request-id"] = request_id
     forced_node = request.query_params.get("node")
     session_id = request.headers.get("x-session-id")
@@ -1699,6 +2083,32 @@ async def metrics():
             lines.append(f'ai_lb_hedge_wins_total{{model="{m}"}} {v}')
     except Exception:
         pass
+
+    # Multi-backend execution metrics
+    lines.append("# HELP ai_lb_multi_exec_total Total multi-backend execution requests by mode")
+    lines.append("# TYPE ai_lb_multi_exec_total counter")
+    multi_total = await redis_client.get("lb:multi_exec_total")
+    lines.append(f"ai_lb_multi_exec_total {int(multi_total) if multi_total else 0}")
+    for mode in ("race", "all", "sequence", "consensus"):
+        val = await redis_client.get(f"lb:multi_exec_total:{mode}")
+        if val:
+            lines.append(f'ai_lb_multi_exec_total{{mode="{mode}"}} {int(val)}')
+
+    lines.append("# HELP ai_lb_multi_exec_backends Backends attempted per multi-exec request by mode")
+    lines.append("# TYPE ai_lb_multi_exec_backends summary")
+    for mode in ("race", "all", "sequence", "consensus"):
+        s_sum = await redis_client.get(f"lb:multi_exec_backends_sum:{mode}")
+        s_cnt = await redis_client.get(f"lb:multi_exec_backends_count:{mode}")
+        if s_cnt and int(s_cnt) > 0:
+            lines.append(f'ai_lb_multi_exec_backends_sum{{mode="{mode}"}} {int(s_sum) if s_sum else 0}')
+            lines.append(f'ai_lb_multi_exec_backends_count{{mode="{mode}"}} {int(s_cnt)}')
+
+    lines.append("# HELP ai_lb_multi_exec_succeeded Backends that succeeded per multi-exec request by mode")
+    lines.append("# TYPE ai_lb_multi_exec_succeeded counter")
+    for mode in ("race", "all", "sequence", "consensus"):
+        val = await redis_client.get(f"lb:multi_exec_succeeded_sum:{mode}")
+        if val:
+            lines.append(f'ai_lb_multi_exec_succeeded{{mode="{mode}"}} {int(val)}')
 
     content = "\n".join(lines) + "\n"
     return Response(content=content, media_type="text/plain; version=0.0.4; charset=utf-8")
