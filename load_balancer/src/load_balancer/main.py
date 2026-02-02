@@ -839,6 +839,51 @@ async def _record_multi_exec_metrics(mode: str, backends_attempted: int, backend
         pass
 
 
+async def _record_consensus_metrics(
+    model_name: str,
+    comparison_type: str,
+    agreement_count: int,
+    total_backends: int,
+    disagreement: bool,
+    latency_ms: float
+):
+    """Record detailed consensus metrics for observability."""
+    try:
+        # Total consensus requests
+        await redis_client.incrby("lb:consensus_total", 1)
+        await redis_client.incrby(f"lb:consensus_total:model:{model_name}", 1)
+
+        # Agreement vs disagreement
+        if disagreement:
+            await redis_client.incrby("lb:consensus_disagreements", 1)
+            await redis_client.incrby(f"lb:consensus_disagreements:model:{model_name}", 1)
+            await redis_client.incrby(f"lb:consensus_disagreements:type:{comparison_type}", 1)
+        else:
+            await redis_client.incrby("lb:consensus_agreements", 1)
+            await redis_client.incrby(f"lb:consensus_agreements:model:{model_name}", 1)
+            await redis_client.incrby(f"lb:consensus_agreements:type:{comparison_type}", 1)
+
+        # Agreement count distribution (how many backends agreed)
+        await redis_client.incrby(f"lb:consensus_agreement_count:{agreement_count}", 1)
+
+        # Backends count distribution
+        await redis_client.incrby(f"lb:consensus_backends:{total_backends}", 1)
+
+        # Comparison type usage
+        await redis_client.incrby(f"lb:consensus_comparison:{comparison_type}", 1)
+
+        # Consensus latency tracking (use same bucket approach as regular latency)
+        for le in _LAT_BUCKETS:
+            if latency_ms / 1000.0 <= le:
+                await redis_client.incrby(f"lb:consensus_latency_bucket:{model_name}:{le}", 1)
+
+        # Track series for metrics exposition
+        await redis_client.sadd("lb:consensus_models", model_name)
+
+    except Exception as e:
+        logger.warning(f"Failed to record consensus metrics: {e}")
+
+
 async def _handle_multi_backend_execution(
     request: Request,
     body: Dict[str, Any],
@@ -955,6 +1000,17 @@ async def _handle_multi_backend_execution(
         consensus = await engine.execute_consensus(backends, make_request, exec_config.timeout_secs)
         succeeded = sum(1 for r in consensus.all_responses if r.success)
         await _record_multi_exec_metrics("consensus", len(backends), succeeded)
+
+        # Record detailed consensus metrics
+        consensus_latency_ms = (time.monotonic() - start_time) * 1000
+        await _record_consensus_metrics(
+            model_name=model_name,
+            comparison_type=consensus.comparison_type,
+            agreement_count=consensus.agreement_count,
+            total_backends=len(backends),
+            disagreement=consensus.disagreement,
+            latency_ms=consensus_latency_ms
+        )
 
         # Build consensus response
         resp_body = {
@@ -2210,6 +2266,98 @@ async def metrics():
         val = await redis_client.get(f"lb:multi_exec_succeeded_sum:{mode}")
         if val:
             lines.append(f'ai_lb_multi_exec_succeeded{{mode="{mode}"}} {int(val)}')
+
+    # Consensus-specific metrics
+    lines.append("# HELP ai_lb_consensus_total Total consensus requests")
+    lines.append("# TYPE ai_lb_consensus_total counter")
+    cons_total = await redis_client.get("lb:consensus_total")
+    lines.append(f"ai_lb_consensus_total {int(cons_total) if cons_total else 0}")
+
+    lines.append("# HELP ai_lb_consensus_agreements Consensus agreements (no disagreement detected)")
+    lines.append("# TYPE ai_lb_consensus_agreements counter")
+    cons_agree = await redis_client.get("lb:consensus_agreements")
+    lines.append(f"ai_lb_consensus_agreements {int(cons_agree) if cons_agree else 0}")
+
+    lines.append("# HELP ai_lb_consensus_disagreements Consensus disagreements detected")
+    lines.append("# TYPE ai_lb_consensus_disagreements counter")
+    cons_disagree = await redis_client.get("lb:consensus_disagreements")
+    lines.append(f"ai_lb_consensus_disagreements {int(cons_disagree) if cons_disagree else 0}")
+
+    # Per-model consensus metrics
+    consensus_models = await redis_client.smembers("lb:consensus_models")
+    if consensus_models:
+        lines.append("# HELP ai_lb_consensus_by_model Consensus requests by model")
+        lines.append("# TYPE ai_lb_consensus_by_model counter")
+        for m in consensus_models:
+            val = await redis_client.get(f"lb:consensus_total:model:{m}")
+            if val:
+                lines.append(f'ai_lb_consensus_by_model{{model="{m}"}} {int(val)}')
+
+        lines.append("# HELP ai_lb_consensus_agreements_by_model Consensus agreements by model")
+        lines.append("# TYPE ai_lb_consensus_agreements_by_model counter")
+        for m in consensus_models:
+            val = await redis_client.get(f"lb:consensus_agreements:model:{m}")
+            if val:
+                lines.append(f'ai_lb_consensus_agreements_by_model{{model="{m}"}} {int(val)}')
+
+        lines.append("# HELP ai_lb_consensus_disagreements_by_model Consensus disagreements by model")
+        lines.append("# TYPE ai_lb_consensus_disagreements_by_model counter")
+        for m in consensus_models:
+            val = await redis_client.get(f"lb:consensus_disagreements:model:{m}")
+            if val:
+                lines.append(f'ai_lb_consensus_disagreements_by_model{{model="{m}"}} {int(val)}')
+
+    # Comparison type distribution
+    lines.append("# HELP ai_lb_consensus_by_comparison_type Consensus requests by comparison type")
+    lines.append("# TYPE ai_lb_consensus_by_comparison_type counter")
+    for comp_type in ("hash", "text", "tool_calls", "single"):
+        val = await redis_client.get(f"lb:consensus_comparison:{comp_type}")
+        if val:
+            lines.append(f'ai_lb_consensus_by_comparison_type{{type="{comp_type}"}} {int(val)}')
+
+    # Agreement/disagreement by type
+    lines.append("# HELP ai_lb_consensus_agreements_by_type Agreements by comparison type")
+    lines.append("# TYPE ai_lb_consensus_agreements_by_type counter")
+    for comp_type in ("hash", "text", "tool_calls", "single"):
+        val = await redis_client.get(f"lb:consensus_agreements:type:{comp_type}")
+        if val:
+            lines.append(f'ai_lb_consensus_agreements_by_type{{type="{comp_type}"}} {int(val)}')
+
+    lines.append("# HELP ai_lb_consensus_disagreements_by_type Disagreements by comparison type")
+    lines.append("# TYPE ai_lb_consensus_disagreements_by_type counter")
+    for comp_type in ("hash", "text", "tool_calls", "single"):
+        val = await redis_client.get(f"lb:consensus_disagreements:type:{comp_type}")
+        if val:
+            lines.append(f'ai_lb_consensus_disagreements_by_type{{type="{comp_type}"}} {int(val)}')
+
+    # Backends count distribution
+    lines.append("# HELP ai_lb_consensus_backends_count Consensus requests by number of backends")
+    lines.append("# TYPE ai_lb_consensus_backends_count counter")
+    for n in range(2, 11):  # Support 2-10 backends
+        val = await redis_client.get(f"lb:consensus_backends:{n}")
+        if val:
+            lines.append(f'ai_lb_consensus_backends_count{{backends="{n}"}} {int(val)}')
+
+    # Agreement count distribution
+    lines.append("# HELP ai_lb_consensus_agreement_distribution Agreement count distribution")
+    lines.append("# TYPE ai_lb_consensus_agreement_distribution counter")
+    for n in range(1, 11):  # Support 1-10 agreements
+        val = await redis_client.get(f"lb:consensus_agreement_count:{n}")
+        if val:
+            lines.append(f'ai_lb_consensus_agreement_distribution{{count="{n}"}} {int(val)}')
+
+    # Consensus latency histogram
+    if consensus_models:
+        lines.append("# HELP ai_lb_consensus_latency_seconds Consensus request latency")
+        lines.append("# TYPE ai_lb_consensus_latency_seconds histogram")
+        for m in consensus_models:
+            cumulative = 0
+            for le in _LAT_BUCKETS:
+                val = await redis_client.get(f"lb:consensus_latency_bucket:{m}:{le}")
+                v = int(val) if val else 0
+                cumulative = v
+                le_str = "+Inf" if le == float("inf") else ("%.2f" % le).rstrip('0').rstrip('.')
+                lines.append(f'ai_lb_consensus_latency_seconds_bucket{{model="{m}",le="{le_str}"}} {cumulative}')
 
     content = "\n".join(lines) + "\n"
     return Response(content=content, media_type="text/plain; version=0.0.4; charset=utf-8")
