@@ -952,7 +952,17 @@ async def _backend_supports_model(backend: str, model_name: str) -> bool:
             model_list = cloud_models[cloud_name]
             # Check exact match or equivalents
             equivalent_models = _get_equivalent_models(model_name)
-            return model_name in model_list or any(m in model_list for m in equivalent_models)
+            result = model_name in model_list or any(m in model_list for m in equivalent_models)
+            logger.info(
+                "cloud_support_check: backend=%s model=%s cloud_name=%s models=%s equivalents=%s result=%s",
+                backend,
+                model_name,
+                cloud_name,
+                model_list,
+                equivalent_models,
+                result,
+            )
+            return result
         # If no config, assume cloud backends support requested model
         return True
 
@@ -982,6 +992,7 @@ async def _get_eligible_cloud_backends(model_name: str) -> List[str]:
         # Check model support
         if await _backend_supports_model(cloud_node, model_name):
             eligible.append(cloud_node)
+    logger.info("eligible_cloud_backends: model=%s eligible=%s", model_name, eligible)
     return eligible
 
 
@@ -1010,6 +1021,13 @@ async def _select_backends_for_consensus(
     # Get eligible cloud backends
     cloud_capable = await _get_eligible_cloud_backends(model_name)
     local_capable = [n for n in eligible_local_nodes if not _is_cloud_backend(n)]
+    logger.info(
+        "consensus_select: model=%s local_capable=%s cloud_capable=%s cross_model=%s",
+        model_name,
+        local_capable,
+        cloud_capable,
+        getattr(config, "CROSS_MODEL_FALLBACK", 0),
+    )
 
     # Force-include oracle if specified and capable
     oracle_present = False
