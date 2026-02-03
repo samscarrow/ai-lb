@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
@@ -107,15 +108,71 @@ def _extract_text_content(response: Dict) -> str:
     return message.get("content", "") or ""
 
 
+_THINKING_RE = re.compile(r"<thinking>.*?</thinking>", re.DOTALL | re.IGNORECASE)
+_JSON_FENCE_RE = re.compile(r"^```(?:json)?\s*(.*?)\s*```$", re.DOTALL | re.IGNORECASE)
+
+
+def _strip_thinking(text: str) -> str:
+    """Remove common reasoning wrappers like <thinking>...</thinking>."""
+    if not text:
+        return ""
+    return _THINKING_RE.sub("", text)
+
+
+def _strip_json_fences(text: str) -> str:
+    """If content is fenced as ```json ...```, unwrap it."""
+    if not text:
+        return ""
+    m = _JSON_FENCE_RE.match(text.strip())
+    return m.group(1) if m else text
+
+
+def _try_canonicalize_json(text: str) -> tuple[str, bool]:
+    """If text appears to be JSON, parse and re-dump in canonical form.
+
+    Returns (normalized_text, was_json).
+    """
+    if not text:
+        return "", False
+    candidate = text.strip()
+    if not (candidate.startswith("{") or candidate.startswith("[")):
+        return text, False
+    try:
+        obj = json.loads(candidate)
+    except Exception:
+        # Looks like JSON but isn't parseable
+        return "__INVALID_JSON__:" + candidate, True
+    try:
+        return json.dumps(obj, sort_keys=True, separators=(",", ":")), True
+    except Exception:
+        return candidate, True
+
+
+def _normalize_text_for_compare(text: str) -> str:
+    """Normalize assistant text for hashing/similarity.
+
+    - Strip <thinking> blocks
+    - Unwrap fenced JSON
+    - Collapse whitespace
+    - Canonicalize JSON when possible
+    """
+    if not text:
+        return ""
+    t = _strip_thinking(text)
+    t = _strip_json_fences(t)
+    t = " ".join(t.split())
+    t2, _ = _try_canonicalize_json(t)
+    return t2
+
+
 def _compute_text_similarity(text1: str, text2: str) -> float:
     """Compute similarity ratio between two text strings using SequenceMatcher."""
     if not text1 and not text2:
         return 1.0
     if not text1 or not text2:
         return 0.0
-    # Normalize whitespace
-    t1 = " ".join(text1.split())
-    t2 = " ".join(text2.split())
+    t1 = _normalize_text_for_compare(text1)
+    t2 = _normalize_text_for_compare(text2)
     return SequenceMatcher(None, t1, t2).ratio()
 
 
@@ -124,7 +181,7 @@ def _content_hash(response: Dict) -> str:
     text = _extract_text_content(response)
     tool_calls = _extract_tool_calls(response)
     content = {
-        "text": " ".join(text.split()) if text else "",
+        "text": _normalize_text_for_compare(text) if text else "",
         "tool_calls": _normalize_tool_calls(tool_calls) if tool_calls else ""
     }
     return hashlib.sha256(json.dumps(content, sort_keys=True).encode()).hexdigest()
@@ -258,7 +315,7 @@ def _apply_oracle_and_local_cloud(
                 )
                 consensus.winner = oracle_result
                 # Recalculate agreement count with oracle as reference
-                oracle_normalized_text = " ".join(oracle_text.split()) if oracle_text else ""
+                oracle_normalized_text = _normalize_text_for_compare(oracle_text) if oracle_text else ""
                 new_agreement = 1  # Oracle agrees with itself
                 for r in successful:
                     if r.backend != oracle_backend:
@@ -347,7 +404,7 @@ def _consensus_by_text(
         )
 
     # Fall back to similarity-based grouping
-    texts = [(r, _extract_text_content(r.response_body)) for r in successful]
+    texts = [(r, _normalize_text_for_compare(_extract_text_content(r.response_body))) for r in successful]
 
     # Build similarity matrix and group by threshold
     groups: List[List[BackendResult]] = []
