@@ -250,7 +250,7 @@ async def _resolve_auto_model(prefer_intersection: bool = False) -> Optional[str
         return None
 
     async def _eligible_count(mid: str) -> int:
-        nodes = await get_eligible_nodes(mid)
+        nodes = await get_eligible_nodes(mid, include_cloud=False)
         return len(nodes)
 
     classes_cfg = getattr(config, "MODEL_CLASSES", {}) or {}
@@ -580,7 +580,7 @@ async def _find_fallback_model(current: str) -> Optional[str]:
             for mid in cands:
                 if mid == current:
                     continue
-                nodes = await get_eligible_nodes(mid)
+                nodes = await get_eligible_nodes(mid, include_cloud=False)
                 if len(nodes) >= min_nodes:
                     return mid
     return None
@@ -894,6 +894,31 @@ async def _get_backend_model(backend: str, requested_model: str) -> Optional[str
     Returns the actual model ID to use for this backend, or None if no match.
     """
     equivalent_models = _get_equivalent_models(requested_model)
+    # Cloud backends: choose an appropriate cloud model for the requested model.
+    if _is_cloud_backend(backend):
+        cloud_name = _get_cloud_backend_name(backend)
+        cloud_models = getattr(config, "CLOUD_MODELS", {}) or {}
+        allowed = cloud_models.get(cloud_name, []) if cloud_name else None
+
+        # If there is no explicit CLOUD_MODELS entry, fall back to requested model.
+        if not allowed:
+            return requested_model
+
+        # Exact/equivalent match first
+        if requested_model in allowed:
+            return requested_model
+        for equiv in equivalent_models:
+            if equiv in allowed:
+                return equiv
+
+        # Cross-model: pick by class
+        if bool(getattr(config, "CROSS_MODEL_FALLBACK", 0)):
+            cls = _get_model_class(requested_model)
+            picked = _pick_cloud_model_for_class(cls, cloud_name)
+            return picked
+
+        return None
+
 
     try:
         models_json = await redis_client.get(f"node:{backend}:models")
@@ -953,6 +978,15 @@ async def _backend_supports_model(backend: str, model_name: str) -> bool:
             # Check exact match or equivalents
             equivalent_models = _get_equivalent_models(model_name)
             result = model_name in model_list or any(m in model_list for m in equivalent_models)
+
+            # Cross-model fallback: if enabled, allow cloud backend to participate in consensus
+            # by selecting an appropriate cloud model from the same model class.
+            if not result and bool(getattr(config, "CROSS_MODEL_FALLBACK", 0)):
+                cls = _get_model_class(model_name)
+                picked = _pick_cloud_model_for_class(cls, cloud_name)
+                if picked:
+                    result = True
+
             logger.info(
                 "cloud_support_check: backend=%s model=%s cloud_name=%s models=%s equivalents=%s result=%s",
                 backend,
@@ -1375,6 +1409,31 @@ def _get_model_class(model_name: str) -> Optional[str]:
         if model_name in candidates:
             return class_name
     return None
+
+
+
+def _pick_cloud_model_for_class(model_class: Optional[str], cloud_backend_name: str) -> Optional[str]:
+    """Pick a cloud model id for a given model class and cloud backend.
+
+    Preference order:
+    1) First candidate in MODEL_CLASSES[model_class].candidates that is listed for this cloud backend.
+    2) Otherwise, first configured CLOUD_MODELS entry for the backend.
+
+    Returns None if no candidate exists.
+    """
+    cloud_models = getattr(config, "CLOUD_MODELS", {}) or {}
+    allowed = cloud_models.get(cloud_backend_name, []) or []
+    if not allowed:
+        return None
+
+    if model_class:
+        classes_cfg = getattr(config, "MODEL_CLASSES", {}) or {}
+        candidates = ((classes_cfg.get(model_class) or {}).get("candidates", []) or [])
+        for m in candidates:
+            if m in allowed:
+                return m
+
+    return allowed[0]
 
 
 async def _handle_multi_backend_execution(
