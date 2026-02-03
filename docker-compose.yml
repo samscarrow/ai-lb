@@ -22,6 +22,7 @@ services:
   monitor:
     build:
       context: ./monitor
+      network: host
     container_name: ai_lb_monitor
     network_mode: host
     environment:
@@ -41,6 +42,7 @@ services:
   load_balancer:
     build:
       context: ./load_balancer
+      network: host
     container_name: ai_lb_load_balancer
     network_mode: host
     environment:
@@ -78,6 +80,15 @@ services:
       MULTI_EXEC_CONSENSUS_THRESHOLD: ${MULTI_EXEC_CONSENSUS_THRESHOLD:-0.9}
       BACKEND_ALIASES: ${BACKEND_ALIASES:-}
       MODEL_EQUIVALENTS: ${MODEL_EQUIVALENTS:-}
+      # Cloud backends and fallback chains
+      CLOUD_BACKENDS: ${CLOUD_BACKENDS:-}
+      CLOUD_MODELS: ${CLOUD_MODELS:-}
+      FALLBACK_CHAINS: ${FALLBACK_CHAINS:-}
+      FALLBACK_TOTAL_TIMEOUT_SECS: ${FALLBACK_TOTAL_TIMEOUT_SECS:-120}
+      DEFAULT_FALLBACK_CHAIN: ${DEFAULT_FALLBACK_CHAIN:-}
+      RATE_LIMIT_BACKOFF_BASE_SECS: ${RATE_LIMIT_BACKOFF_BASE_SECS:-1.0}
+      RATE_LIMIT_BACKOFF_MAX_SECS: ${RATE_LIMIT_BACKOFF_MAX_SECS:-60.0}
+      RATE_LIMIT_BACKOFF_JITTER: ${RATE_LIMIT_BACKOFF_JITTER:-0.3}
     depends_on:
       - redis
     restart: unless-stopped
@@ -85,6 +96,19 @@ services:
     # Port mapping not needed in host mode, app must bind to port directly
     # ports:
     #   - "${LOAD_BALANCER_PORT:-8000}:8000"
+
+  # CCProxy service for OAuth-based cloud authentication
+  # Uses existing ChatGPT Plus/Pro or Claude Pro/Max subscriptions instead of API keys
+  # See: https://github.com/CaddyGlow/ccproxy-api
+  ccproxy:
+    image: ghcr.io/caddyglow/ccproxy-api:latest
+    container_name: ai_lb_ccproxy
+    network_mode: host
+    volumes:
+      - ~/.config/ccproxy:/root/.config/ccproxy  # OAuth credentials (bind mount for host access)
+    restart: unless-stopped
+    command: ["ccproxy", "serve", "--port", "8000"]
+    profiles: ["ccproxy"]  # Only start when explicitly enabled
 
 volumes:
   redis_data:

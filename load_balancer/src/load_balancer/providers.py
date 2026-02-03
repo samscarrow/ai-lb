@@ -376,10 +376,57 @@ class AnthropicAdapter(ProviderAdapter):
         return "/messages"  # Anthropic uses /messages not /chat/completions
 
 
+class CCProxyOpenAIAdapter(ProviderAdapter):
+    """Adapter for CCProxy with OpenAI models.
+
+    CCProxy handles OAuth authentication internally, so we skip API key injection.
+    The API key in CLOUD_BACKENDS can be 'dummy' or any placeholder.
+    See: https://github.com/CaddyGlow/ccproxy-api
+    """
+
+    def get_headers(self, api_key: str, base_headers: Dict[str, str]) -> Dict[str, str]:
+        # Filter out headers that we'll set explicitly (case-insensitive)
+        skip_headers = {'content-type', 'accept', 'authorization'}
+        headers = {k: v for k, v in base_headers.items() if k.lower() not in skip_headers}
+        # Provider-specific base headers
+        headers["Content-Type"] = "application/json"
+        headers["Accept"] = "application/json"
+        # CCProxy doesn't require Authorization header - OAuth is handled internally
+        # But we include it anyway in case CCProxy validates it
+        if api_key and api_key.lower() not in ('dummy', 'none', ''):
+            headers["Authorization"] = f"Bearer {api_key}"
+        return headers
+
+
+class CCProxyAnthropicAdapter(AnthropicAdapter):
+    """Adapter for CCProxy with Anthropic/Claude models.
+
+    CCProxy handles OAuth authentication internally. This adapter extends
+    AnthropicAdapter to reuse request/response transformation but skips
+    API key injection.
+    See: https://github.com/CaddyGlow/ccproxy-api
+    """
+
+    def get_headers(self, api_key: str, base_headers: Dict[str, str]) -> Dict[str, str]:
+        # Filter out headers that we'll set explicitly (case-insensitive)
+        skip_headers = {'content-type', 'accept', 'authorization', 'x-api-key'}
+        headers = {k: v for k, v in base_headers.items() if k.lower() not in skip_headers}
+        # Provider-specific base headers
+        headers["Content-Type"] = "application/json"
+        headers["Accept"] = "application/json"
+        # CCProxy handles auth via OAuth - skip x-api-key injection
+        # But include version headers for API compatibility
+        headers["anthropic-version"] = "2023-06-01"
+        headers["anthropic-beta"] = "tools-2024-04-04"
+        return headers
+
+
 # Provider registry
 PROVIDER_ADAPTERS: Dict[str, ProviderAdapter] = {
     "openai": OpenAIAdapter(),
     "anthropic": AnthropicAdapter(),
+    "ccproxy-openai": CCProxyOpenAIAdapter(),
+    "ccproxy-anthropic": CCProxyAnthropicAdapter(),
 }
 
 

@@ -5883,3 +5883,7 @@ INFO:     127.0.0.1:54404 - "GET /v1/models HTTP/1.1" 200 OK
 INFO:     127.0.0.1:51324 - "POST /v1/chat/completions HTTP/1.1" 404 Not Found
 INFO:     127.0.0.1:33448 - "POST /v1/chat/completions HTTP/1.1" 404 Not Found
 INFO:     127.0.0.1:58888 - "POST /v1/chat/completions HTTP/1.1" 404 Not Found
+INFO:     Shutting down
+INFO:     Waiting for application shutdown.
+INFO:     Application shutdown complete.
+INFO:     Finished server process [984380]
