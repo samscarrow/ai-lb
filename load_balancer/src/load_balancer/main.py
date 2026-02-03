@@ -4,7 +4,8 @@ import redis.asyncio as redis
 import json
 import logging
 import time
-from typing import Any, Dict, List, Optional
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
 from fastapi import FastAPI, Request, Response, HTTPException
 from fastapi.responses import StreamingResponse, JSONResponse
 import uuid
@@ -21,6 +22,7 @@ from .execution import (
     ConsensusResult,
     ExecutionEngine,
 )
+from .providers import get_adapter
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -646,21 +648,64 @@ async def _set_sticky_node(session_id: Optional[str], model_name: str, node: str
 # ---------------------- Multi-Backend Execution Helpers ----------------------
 
 
-def _parse_execution_mode(request: Request) -> Optional[ExecutionConfig]:
+@dataclass
+class ExtendedExecutionConfig:
+    """Extended execution config with oracle and fallback chain support."""
+    base: ExecutionConfig
+    # Oracle configuration for consensus mode
+    oracle_backend: Optional[str] = None  # Validated oracle backend (e.g., "cloud:openai")
+    oracle_valid: bool = True  # Whether the oracle header was valid
+    # Fallback chain configuration
+    fallback_chain: Optional[str] = None  # Name of fallback chain to use
+
+
+def _parse_execution_mode(request: Request) -> Optional[ExtendedExecutionConfig]:
     """Parse execution mode from request headers or query params.
 
     Headers (preferred):
         X-Execution-Mode: race | all | sequence | consensus
         X-Target-Backends: alias1,alias2,... (optional)
         X-Max-Backends: N (optional, default 3)
+        X-Consensus-Oracle: openai | cloud:openai (optional, for consensus mode)
+        X-Fallback-Chain: chain_name (optional, takes precedence over X-Execution-Mode)
 
     Query params (fallback):
         ?mode=race|all|sequence|consensus
         &backends=alias1,alias2,...
         &max_backends=N
+
+    Precedence rules:
+    - X-Fallback-Chain takes precedence over X-Execution-Mode
+    - If both are set, X-Execution-Mode is ignored (logged as warning)
     """
     if not getattr(config, "MULTI_EXEC_ENABLED", True):
         return None
+
+    # Check for fallback chain first (takes precedence)
+    fallback_chain = request.headers.get("x-fallback-chain")
+    if fallback_chain:
+        fallback_chain = fallback_chain.strip()
+        chains = getattr(config, "FALLBACK_CHAINS", {}) or {}
+        if fallback_chain not in chains:
+            # Invalid chain name - return None to use standard routing
+            logger.warning(f"Unknown fallback chain: {fallback_chain}")
+            return None
+        # Log if execution mode was also set
+        if request.headers.get("x-execution-mode"):
+            logger.warning(
+                f"Both X-Fallback-Chain ({fallback_chain}) and X-Execution-Mode set. "
+                "Fallback chain takes precedence."
+            )
+        # Return a config that signals fallback chain execution
+        return ExtendedExecutionConfig(
+            base=ExecutionConfig(
+                mode=ExecutionMode.SEQUENCE,  # Fallback is sequential failover
+                target_backends=None,
+                max_backends=1,
+                timeout_secs=float(getattr(config, "FALLBACK_TOTAL_TIMEOUT_SECS", 120))
+            ),
+            fallback_chain=fallback_chain
+        )
 
     # Check header first, then query param
     mode_str = request.headers.get("x-execution-mode") or request.query_params.get("mode")
@@ -697,11 +742,31 @@ def _parse_execution_mode(request: Request) -> Optional[ExecutionConfig]:
         except ValueError:
             pass
 
-    return ExecutionConfig(
-        mode=mode,
-        target_backends=target_backends,
-        max_backends=max_backends,
-        timeout_secs=timeout_secs
+    # Parse and validate oracle header (for consensus mode)
+    oracle_raw = request.headers.get("x-consensus-oracle")
+    oracle = None
+    oracle_valid = True
+
+    if oracle_raw and mode == ExecutionMode.CONSENSUS:
+        # Normalize: "openai" -> "cloud:openai", "cloud:openai" -> "cloud:openai"
+        oracle_name = oracle_raw.strip().replace("cloud:", "")
+        cloud_backends = getattr(config, "CLOUD_BACKENDS", {}) or {}
+
+        if oracle_name in cloud_backends:
+            oracle = f"cloud:{oracle_name}"
+        else:
+            oracle_valid = False  # Unknown backend key
+            logger.warning(f"Invalid oracle backend: {oracle_raw}")
+
+    return ExtendedExecutionConfig(
+        base=ExecutionConfig(
+            mode=mode,
+            target_backends=target_backends,
+            max_backends=max_backends,
+            timeout_secs=timeout_secs
+        ),
+        oracle_backend=oracle,
+        oracle_valid=oracle_valid
     )
 
 
@@ -741,6 +806,8 @@ def _get_cloud_config(node: str) -> Optional[Dict[str, Any]]:
 def _get_cloud_url(node: str, endpoint: str = "/chat/completions") -> Optional[str]:
     """Get the full URL for a cloud backend endpoint.
 
+    Uses provider adapters to determine the correct endpoint path.
+
     Args:
         node: Cloud node address (e.g., 'cloud:openai')
         endpoint: API endpoint path (e.g., '/chat/completions')
@@ -754,13 +821,26 @@ def _get_cloud_url(node: str, endpoint: str = "/chat/completions") -> Optional[s
     base_url = cfg.get("url", "").rstrip("/")
     if not base_url:
         return None
+
+    # Use provider adapter for endpoint path
+    provider_type = cfg.get("provider_type", "openai")
+    adapter = get_adapter(provider_type)
+
+    # Map generic endpoint to provider-specific endpoint
+    if endpoint == "/chat/completions":
+        endpoint = adapter.get_chat_endpoint()
+    elif endpoint == "/embeddings":
+        endpoint = adapter.get_embeddings_endpoint()
+
     return f"{base_url}{endpoint}"
 
 
 def _get_cloud_headers(node: str, headers: Dict[str, str]) -> Dict[str, str]:
-    """Inject cloud API key into headers for a cloud backend request.
+    """Inject cloud API auth into headers for a cloud backend request.
 
-    Returns updated headers dict with Authorization header set.
+    Uses provider adapters for provider-specific auth (Bearer vs x-api-key).
+
+    Returns updated headers dict with authentication set.
     """
     cfg = _get_cloud_config(node)
     if not cfg:
@@ -770,10 +850,11 @@ def _get_cloud_headers(node: str, headers: Dict[str, str]) -> Dict[str, str]:
     if not api_key:
         return headers
 
-    # Create new headers dict to avoid mutating original
-    updated = dict(headers)
-    updated["Authorization"] = f"Bearer {api_key}"
-    return updated
+    # Use provider adapter for headers
+    provider_type = cfg.get("provider_type", "openai")
+    adapter = get_adapter(provider_type)
+
+    return adapter.get_headers(api_key, headers)
 
 
 def _get_equivalent_models(model_name: str) -> List[str]:
@@ -848,6 +929,129 @@ async def _get_eligible_nodes_for_equivalents(model_name: str) -> List[str]:
     return list(all_eligible)
 
 
+async def _backend_supports_model(backend: str, model_name: str) -> bool:
+    """Check if backend supports the requested model.
+
+    For cloud backends, checks CLOUD_MODELS configuration.
+    For local backends, checks Redis model list.
+    """
+    if _is_cloud_backend(backend):
+        # Check cloud models config
+        cloud_name = _get_cloud_backend_name(backend)
+        cloud_models = getattr(config, "CLOUD_MODELS", {}) or {}
+        if cloud_name and cloud_name in cloud_models:
+            model_list = cloud_models[cloud_name]
+            # Check exact match or equivalents
+            equivalent_models = _get_equivalent_models(model_name)
+            return model_name in model_list or any(m in model_list for m in equivalent_models)
+        # If no config, assume cloud backends support requested model
+        return True
+
+    # For local backends, check Redis
+    try:
+        models_json = await redis_client.get(f"node:{backend}:models")
+        if not models_json:
+            return False
+        models = json.loads(models_json).get("data", [])
+        backend_model_ids = {m.get("id") for m in models if m.get("id")}
+        # Check exact match or equivalents
+        equivalent_models = _get_equivalent_models(model_name)
+        return model_name in backend_model_ids or any(m in backend_model_ids for m in equivalent_models)
+    except Exception:
+        return False
+
+
+async def _get_eligible_cloud_backends(model_name: str) -> List[str]:
+    """Get list of cloud backends that support the requested model and are not rate-limited."""
+    cloud_backends = getattr(config, "CLOUD_BACKENDS", {}) or {}
+    eligible = []
+    for name in cloud_backends.keys():
+        cloud_node = f"cloud:{name}"
+        # Check rate limit status
+        if await _is_rate_limited(cloud_node):
+            continue
+        # Check model support
+        if await _backend_supports_model(cloud_node, model_name):
+            eligible.append(cloud_node)
+    return eligible
+
+
+async def _select_backends_for_consensus(
+    exec_config: ExecutionConfig,
+    model_name: str,
+    eligible_local_nodes: List[str],
+    oracle_backend: Optional[str] = None
+) -> Tuple[List[str], bool]:
+    """Select backends ensuring mix of local + cloud for consensus.
+
+    Mix Policy:
+    - Minimum: 1 local + 1 cloud (if both available)
+    - Target: 2 local + 1 cloud for 3-way consensus
+    - Fallback: if only one side exists, use what's available
+
+    Args:
+        exec_config: Execution configuration
+        model_name: The requested model name
+        eligible_local_nodes: List of eligible local nodes
+        oracle_backend: Optional oracle backend to force-include
+
+    Returns:
+        (selected_backends, oracle_present)
+    """
+    # Get eligible cloud backends
+    cloud_capable = await _get_eligible_cloud_backends(model_name)
+    local_capable = [n for n in eligible_local_nodes if not _is_cloud_backend(n)]
+
+    # Force-include oracle if specified and capable
+    oracle_present = False
+    selected = []
+
+    if oracle_backend and oracle_backend in cloud_capable:
+        selected.append(oracle_backend)
+        cloud_capable.remove(oracle_backend)
+        oracle_present = True
+    elif oracle_backend and oracle_backend not in cloud_capable:
+        # Oracle was requested but not available
+        logger.warning(f"Oracle backend {oracle_backend} not available for model {model_name}")
+
+    # Apply mix policy
+    max_b = exec_config.max_backends
+    remaining = max_b - len(selected)
+
+    if local_capable and cloud_capable:
+        # Both sides available: aim for 2 local + 1 cloud (or 1+1 minimum)
+        local_target = min(2, remaining - 1) if remaining > 1 else 1
+        cloud_target = 1 if not oracle_present else 0
+    elif local_capable:
+        # Only local available
+        local_target = remaining
+        cloud_target = 0
+    else:
+        # Only cloud available
+        local_target = 0
+        cloud_target = remaining
+
+    # Select local backends
+    local_pool = list(local_capable)
+    for _ in range(min(local_target, len(local_pool))):
+        if not local_pool:
+            break
+        # Use router to pick best candidate from remaining pool
+        candidate = await router.select_node(local_pool, model_name, redis_client)
+        if candidate:
+            selected.append(candidate)
+            local_pool.remove(candidate)
+
+    # Select additional cloud backends
+    for _ in range(min(cloud_target, len(cloud_capable))):
+        if not cloud_capable:
+            break
+        candidate = cloud_capable.pop(0)  # Take first available
+        selected.append(candidate)
+
+    return selected, oracle_present
+
+
 async def _select_backends_for_execution(
     exec_config: ExecutionConfig,
     model_name: str,
@@ -890,8 +1094,12 @@ async def _make_backend_request(
     start_time: float,
     backend_model_override: Optional[str] = None
 ) -> BackendResult:
-    """Make a single non-streaming request to a backend and return result."""
-    # Determine URL based on backend type (cloud vs local)
+    """Make a single non-streaming request to a backend and return result.
+
+    For cloud backends, uses provider adapters for request/response transformation.
+    """
+    # Determine URL and adapter based on backend type (cloud vs local)
+    adapter = None
     if _is_cloud_backend(backend):
         url = _get_cloud_url(backend, "/chat/completions")
         if not url:
@@ -903,6 +1111,11 @@ async def _make_backend_request(
         # Inject API key for cloud backends
         headers = _get_cloud_headers(backend, headers)
         alias = _get_cloud_backend_name(backend)
+        # Get provider adapter for request/response transformation
+        cfg = _get_cloud_config(backend)
+        if cfg:
+            provider_type = cfg.get("provider_type", "openai")
+            adapter = get_adapter(provider_type)
     else:
         url = f"http://{backend}/v1/chat/completions"
         alias = _get_backend_alias(backend)
@@ -915,6 +1128,10 @@ async def _make_backend_request(
     request_body = dict(body)
     if backend_model_override:
         request_body["model"] = backend_model_override
+
+    # Transform request for provider-specific format
+    if adapter:
+        request_body = adapter.transform_request(request_body)
 
     acquired = await _acquire_slot(backend)
     if not acquired:
@@ -956,7 +1173,11 @@ async def _make_backend_request(
                 await _clear_rate_limit(backend)
                 result.success = True
                 try:
-                    result.response_body = resp.json()
+                    response_body = resp.json()
+                    # Transform response to OpenAI format if using provider adapter
+                    if adapter:
+                        response_body = adapter.transform_response(response_body)
+                    result.response_body = response_body
                 except Exception:
                     result.response_body = {"raw": resp.text}
         except AttributeError:
@@ -987,7 +1208,11 @@ async def _make_backend_request(
                     await _clear_rate_limit(backend)
                     result.success = True
                     try:
-                        result.response_body = json.loads(bytes(chunks))
+                        response_body = json.loads(bytes(chunks))
+                        # Transform response to OpenAI format if using provider adapter
+                        if adapter:
+                            response_body = adapter.transform_response(response_body)
+                        result.response_body = response_body
                     except Exception:
                         result.response_body = {"raw": bytes(chunks).decode(errors="replace")}
 
@@ -1020,7 +1245,8 @@ async def _record_multi_exec_metrics(mode: str, backends_attempted: int, backend
 async def _record_consensus_metrics(
     model_name: str,
     consensus: ConsensusResult,
-    backends: List[str]
+    backends: List[str],
+    oracle_valid: bool = True
 ):
     """Record detailed metrics for consensus operations.
 
@@ -1030,8 +1256,14 @@ async def _record_consensus_metrics(
     - Comparison type distribution (hash, text, tool_calls)
     - Per-model consensus quality
     - Backend combinations that disagree
+    - Local vs cloud agreement
+    - Oracle tracking
+    - Per-backend error tracking
     """
     try:
+        # Determine model class for per-class tracking
+        model_class = _get_model_class(model_name)
+
         # Total consensus requests
         await redis_client.incrby("lb:consensus_total", 1)
         await redis_client.incrby(f"lb:consensus_total:{model_name}", 1)
@@ -1061,14 +1293,67 @@ async def _record_consensus_metrics(
         # Add to series for easier metric export
         await redis_client.sadd("lb:consensus_models", model_name)
 
+        # Local vs cloud agreement tracking
+        local_backends = [b for b in backends if not _is_cloud_backend(b)]
+        cloud_backends = [b for b in backends if _is_cloud_backend(b)]
+
+        if local_backends and cloud_backends:
+            await redis_client.incrby("lb:consensus_local_cloud_total", 1)
+            if model_class:
+                await redis_client.incrby(f"lb:consensus_local_cloud_total:{model_class}", 1)
+
+            if consensus.local_cloud_agreement is True:
+                await redis_client.incrby("lb:consensus_local_cloud_agreed", 1)
+                if model_class:
+                    await redis_client.incrby(f"lb:consensus_local_cloud_agreed:{model_class}", 1)
+            elif consensus.local_cloud_agreement is False:
+                await redis_client.incrby("lb:consensus_local_cloud_disagreed", 1)
+
+            # Track similarity score histogram (buckets: 0.0, 0.1, ..., 1.0)
+            if consensus.local_cloud_similarity is not None:
+                bucket = int(consensus.local_cloud_similarity * 10) / 10  # Round to nearest 0.1
+                await redis_client.incrby(f"lb:consensus_similarity_bucket:{bucket:.1f}", 1)
+
+        # Oracle tracking
+        if consensus.oracle_backend:
+            await redis_client.incrby("lb:consensus_oracle_requested", 1)
+            if consensus.oracle_present:
+                await redis_client.incrby("lb:consensus_oracle_present", 1)
+                if consensus.oracle_agreed is True:
+                    await redis_client.incrby("lb:consensus_oracle_agreed", 1)
+                elif consensus.oracle_agreed is False:
+                    await redis_client.incrby("lb:consensus_oracle_disagreed", 1)
+            else:
+                await redis_client.incrby("lb:consensus_oracle_missing", 1)
+
+        if not oracle_valid:
+            await redis_client.incrby("lb:consensus_oracle_invalid", 1)
+
+        # Per-backend error code tracking
+        for result in consensus.all_responses:
+            if result.status_code == 429:
+                await redis_client.incrby(f"lb:backend_errors:429:{result.backend}", 1)
+            elif result.status_code >= 500:
+                await redis_client.incrby(f"lb:backend_errors:5xx:{result.backend}", 1)
+
     except Exception:
         pass
+
+
+def _get_model_class(model_name: str) -> Optional[str]:
+    """Get the model class (e.g., 'small', 'medium', 'large') for a model."""
+    classes = getattr(config, "MODEL_CLASSES", {}) or {}
+    for class_name, class_cfg in classes.items():
+        candidates = class_cfg.get("candidates", [])
+        if model_name in candidates:
+            return class_name
+    return None
 
 
 async def _handle_multi_backend_execution(
     request: Request,
     body: Dict[str, Any],
-    exec_config: ExecutionConfig,
+    ext_config: ExtendedExecutionConfig,
     model_name: str,
     eligible_nodes: List[str],
     request_id: str,
@@ -1078,11 +1363,18 @@ async def _handle_multi_backend_execution(
     warm_wait_ms: int,
     model_defaulted: bool
 ) -> Response:
-    """Handle multi-backend execution modes (race, all, sequence, consensus)."""
+    """Handle multi-backend execution modes (race, all, sequence, consensus).
+
+    Supports extended execution config with oracle and fallback chain features.
+    """
+    exec_config = ext_config.base
+    oracle_backend = ext_config.oracle_backend
+    oracle_valid = ext_config.oracle_valid
+
     headers = {
         key: value
         for key, value in request.headers.items()
-        if key.lower() not in ('host', 'content-length', 'x-execution-mode', 'x-target-backends', 'x-max-backends')
+        if key.lower() not in ('host', 'content-length', 'x-execution-mode', 'x-target-backends', 'x-max-backends', 'x-consensus-oracle', 'x-fallback-chain')
     }
     headers["x-request-id"] = request_id
 
@@ -1094,8 +1386,15 @@ async def _handle_multi_backend_execution(
     else:
         all_eligible = eligible_nodes
 
-    # Select backends
-    backends = await _select_backends_for_execution(exec_config, model_name, all_eligible)
+    # Select backends - use consensus-specific selection for consensus mode
+    oracle_present = False
+    if exec_config.mode == ExecutionMode.CONSENSUS:
+        backends, oracle_present = await _select_backends_for_consensus(
+            exec_config, model_name, all_eligible, oracle_backend
+        )
+    else:
+        backends = await _select_backends_for_execution(exec_config, model_name, all_eligible)
+
     if not backends:
         raise HTTPException(status_code=404, detail="No eligible backends for multi-exec")
 
@@ -1178,10 +1477,16 @@ async def _handle_multi_backend_execution(
         out = JSONResponse(content=resp_body)
 
     elif exec_config.mode == ExecutionMode.CONSENSUS:
-        consensus = await engine.execute_consensus(backends, make_request, exec_config.timeout_secs)
+        # Execute consensus with oracle and local/cloud tracking
+        consensus = await engine.execute_consensus(
+            backends, make_request, exec_config.timeout_secs,
+            oracle_backend=oracle_backend,
+            oracle_present=oracle_present,
+            is_cloud_fn=_is_cloud_backend
+        )
         succeeded = sum(1 for r in consensus.all_responses if r.success)
         await _record_multi_exec_metrics("consensus", len(backends), succeeded)
-        await _record_consensus_metrics(model_name, consensus, backends)
+        await _record_consensus_metrics(model_name, consensus, backends, oracle_valid)
 
         # Build consensus response
         resp_body = {
@@ -1195,6 +1500,11 @@ async def _handle_multi_backend_execution(
             "agreement_count": consensus.agreement_count,
             "disagreement": consensus.disagreement,
             "comparison_type": consensus.comparison_type,
+            "oracle_backend": consensus.oracle_backend,
+            "oracle_present": consensus.oracle_present,
+            "oracle_agreed": consensus.oracle_agreed,
+            "local_cloud_agreement": consensus.local_cloud_agreement,
+            "local_cloud_similarity": consensus.local_cloud_similarity,
             "all_responses": [
                 {
                     "backend": r.backend,
@@ -1208,9 +1518,25 @@ async def _handle_multi_backend_execution(
             ]
         }
         out = JSONResponse(content=resp_body)
-        # Add disagreement header
+
+        # Add consensus-specific headers
         if consensus.disagreement:
             out.headers["x-disagreement"] = "true"
+
+        # Oracle validation headers
+        if not oracle_valid:
+            out.headers["x-consensus-oracle"] = "invalid"
+        elif consensus.oracle_backend:
+            out.headers["x-consensus-oracle"] = _get_cloud_backend_name(consensus.oracle_backend) or consensus.oracle_backend
+            out.headers["x-oracle-present"] = "true" if consensus.oracle_present else "false"
+            if consensus.oracle_present and consensus.oracle_agreed is not None:
+                out.headers["x-oracle-agreed"] = "true" if consensus.oracle_agreed else "false"
+
+        # Local vs cloud agreement headers
+        if consensus.local_cloud_agreement is not None:
+            out.headers["x-local-cloud-agreement"] = "true" if consensus.local_cloud_agreement else "false"
+        if consensus.local_cloud_similarity is not None:
+            out.headers["x-local-cloud-similarity"] = f"{consensus.local_cloud_similarity:.2f}"
 
     else:
         raise HTTPException(status_code=400, detail=f"Unknown execution mode: {exec_config.mode}")
@@ -1240,6 +1566,145 @@ async def _handle_multi_backend_execution(
             pass
 
     return out
+
+
+async def _execute_with_fallback_chain(
+    chain_name: str,
+    body: Dict[str, Any],
+    headers: Dict[str, str],
+    request_id: str,
+    start_time: float,
+    model_name: str
+) -> Response:
+    """Execute request following a fallback chain until success.
+
+    Each backend in the chain has its own timeout and retry budget.
+    Total execution respects FALLBACK_TOTAL_TIMEOUT_SECS.
+
+    Args:
+        chain_name: Name of the fallback chain from config
+        body: Request body
+        headers: Request headers
+        request_id: Request ID for tracking
+        start_time: Request start time
+        model_name: The requested model name
+
+    Returns:
+        JSONResponse with the successful result
+
+    Raises:
+        HTTPException if all backends in chain fail
+    """
+    chains = getattr(config, "FALLBACK_CHAINS", {}) or {}
+    chain = chains.get(chain_name, [])
+
+    if not chain:
+        raise HTTPException(status_code=400, detail=f"Unknown fallback chain: {chain_name}")
+
+    total_timeout = float(getattr(config, "FALLBACK_TOTAL_TIMEOUT_SECS", 120))
+    chain_start = time.monotonic()
+    last_error = None
+    attempted_backends: List[str] = []
+    last_status_code = 502
+
+    await _inc_requests_total()
+
+    for fb in chain:
+        # Check total timeout
+        elapsed = time.monotonic() - chain_start
+        if elapsed >= total_timeout:
+            logger.warning(f"[req={request_id}] Fallback chain {chain_name} exceeded total timeout")
+            break
+
+        backend = fb.backend
+        remaining_timeout = min(fb.timeout_secs, total_timeout - elapsed)
+
+        # Resolve "local:auto" to best available local backend
+        if backend == "local:auto":
+            local_nodes = await get_eligible_nodes(model_name)
+            local_nodes = [n for n in local_nodes if not _is_cloud_backend(n)]
+            if not local_nodes:
+                logger.info(f"[req={request_id}] No local backends available, skipping local:auto")
+                continue
+            backend = await router.select_node(local_nodes, model_name, redis_client)
+            if not backend:
+                continue
+
+        # Normalize cloud backend names
+        if not _is_cloud_backend(backend) and not ":" in backend:
+            # Might be a cloud backend name without prefix
+            cloud_backends = getattr(config, "CLOUD_BACKENDS", {}) or {}
+            if backend in cloud_backends:
+                backend = f"cloud:{backend}"
+
+        # Per-backend retry loop
+        for attempt in range(fb.max_retries + 1):
+            try:
+                attempted_backends.append(backend)
+                logger.info(f"[req={request_id}] Fallback chain {chain_name}: trying {backend} (attempt {attempt + 1})")
+
+                result = await asyncio.wait_for(
+                    _make_backend_request(
+                        backend, body, headers, model_name, request_id, start_time
+                    ),
+                    timeout=remaining_timeout
+                )
+
+                if result.success:
+                    logger.info(f"[req={request_id}] Fallback chain {chain_name}: success on {backend}")
+                    # Record metrics
+                    await redis_client.incrby(f"lb:fallback_chain_success:{chain_name}", 1)
+                    await redis_client.incrby(f"lb:fallback_chain_success:{chain_name}:{backend}", 1)
+
+                    out = JSONResponse(content=result.response_body)
+                    out.headers["x-fallback-chain"] = chain_name
+                    out.headers["x-fallback-backend"] = backend
+                    out.headers["x-fallback-attempts"] = str(len(attempted_backends))
+                    out.headers["x-request-id"] = request_id
+                    out.headers["x-selected-model"] = model_name
+                    return out
+
+                last_error = result.error
+                last_status_code = result.status_code or 502
+
+                # Don't retry on 4xx (client errors) except 429
+                if result.status_code and 400 <= result.status_code < 500:
+                    if result.status_code == 429:
+                        # Check if we have Retry-After that's within our budget
+                        # The rate limit is already recorded, so this backend will be skipped
+                        # on next iteration. Move to next backend in chain.
+                        logger.info(f"[req={request_id}] Backend {backend} rate limited (429), moving to next")
+                        break
+                    # Other 4xx - client error, don't retry
+                    logger.info(f"[req={request_id}] Backend {backend} returned {result.status_code}, moving to next")
+                    break
+
+            except asyncio.TimeoutError:
+                last_error = f"Timeout after {remaining_timeout}s"
+                logger.info(f"[req={request_id}] Backend {backend} timed out")
+                break
+            except Exception as e:
+                last_error = str(e)
+                logger.warning(f"[req={request_id}] Backend {backend} error: {e}")
+
+            # Backoff between retries (only for 5xx/network errors)
+            if attempt < fb.max_retries:
+                backoff = 0.5 * (attempt + 1)
+                await asyncio.sleep(backoff)
+
+    # All backends failed
+    logger.warning(f"[req={request_id}] Fallback chain {chain_name} exhausted. Last error: {last_error}")
+    await redis_client.incrby(f"lb:fallback_chain_exhausted:{chain_name}", 1)
+
+    raise HTTPException(
+        status_code=last_status_code,
+        detail={
+            "message": f"All backends in chain '{chain_name}' failed",
+            "last_error": last_error,
+            "attempted": attempted_backends
+        },
+        headers={"x-fallback-chain": chain_name}
+    )
 
 
 @app.get("/v1/models")
@@ -1376,8 +1841,24 @@ async def chat_completions(request: Request):
                     eligible_nodes = fb_nodes
     request_id = request.headers.get("x-request-id") or str(uuid.uuid4())
 
-    # Check for multi-backend execution mode
+    # Check for multi-backend execution mode or fallback chain
     exec_config = _parse_execution_mode(request)
+
+    # Handle fallback chain execution (takes precedence over other modes)
+    if exec_config and exec_config.fallback_chain:
+        headers = {
+            key: value for key, value in request.headers.items()
+            if key.lower() not in ('host', 'content-length', 'x-fallback-chain', 'x-execution-mode')
+        }
+        headers["x-request-id"] = request_id
+        return await _execute_with_fallback_chain(
+            chain_name=exec_config.fallback_chain,
+            body=body,
+            headers=headers,
+            request_id=request_id,
+            start_time=start_time,
+            model_name=model_name
+        )
 
     # For multi-exec, try model equivalents if no direct match
     if not eligible_nodes and exec_config:
@@ -1391,7 +1872,7 @@ async def chat_completions(request: Request):
         return await _handle_multi_backend_execution(
             request=request,
             body=body,
-            exec_config=exec_config,
+            ext_config=exec_config,  # ExtendedExecutionConfig with oracle/fallback support
             model_name=model_name,
             eligible_nodes=eligible_nodes,
             request_id=request_id,

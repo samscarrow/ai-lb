@@ -179,11 +179,12 @@ for canonical, models in MODEL_EQUIVALENTS.items():
         MODEL_EQUIVALENTS_REVERSE[m] = canonical
 
 # Cloud backend configuration
-# Format: "name=url|api_key,name2=url2|api_key2" or semicolon-separated
-# Example: "openai=https://api.openai.com/v1|sk-xxx,anthropic=https://api.anthropic.com/v1|sk-ant-xxx"
+# Format: "name=url|api_key[|provider_type],name2=url2|api_key2[|provider_type]" or semicolon-separated
+# provider_type is optional, defaults to "openai"
+# Example: "openai=https://api.openai.com/v1|sk-xxx|openai,claude=https://api.anthropic.com/v1|sk-ant-xxx|anthropic"
 # URL should include /v1 path for OpenAI-compatible endpoints
 def _parse_cloud_backends(s: str) -> dict:
-    """Parse CLOUD_BACKENDS env var into {name: {url: str, api_key: str, is_cloud: True}}."""
+    """Parse CLOUD_BACKENDS env var into {name: {url, api_key, provider_type, is_cloud}}."""
     mapping = {}
     for part in [p.strip() for p in s.replace(";", ",").split(",") if p.strip()]:
         if "=" not in part:
@@ -193,13 +194,18 @@ def _parse_cloud_backends(s: str) -> dict:
         rest = rest.strip()
         if "|" not in rest:
             continue
-        url, api_key = rest.rsplit("|", 1)
-        url = url.strip()
-        api_key = api_key.strip()
+        parts = rest.split("|")
+        if len(parts) < 2:
+            continue
+        url = parts[0].strip()
+        api_key = parts[1].strip()
+        # Provider type is optional, defaults to "openai"
+        provider_type = parts[2].strip() if len(parts) > 2 else "openai"
         if name and url and api_key:
             mapping[name] = {
                 "url": url,
                 "api_key": api_key,
+                "provider_type": provider_type,
                 "is_cloud": True,
             }
     return mapping
@@ -210,3 +216,74 @@ CLOUD_BACKENDS = _parse_cloud_backends(os.getenv("CLOUD_BACKENDS", ""))
 RATE_LIMIT_BACKOFF_BASE_SECS = float(os.getenv("RATE_LIMIT_BACKOFF_BASE_SECS", 1.0))
 RATE_LIMIT_BACKOFF_MAX_SECS = float(os.getenv("RATE_LIMIT_BACKOFF_MAX_SECS", 60.0))
 RATE_LIMIT_BACKOFF_JITTER = float(os.getenv("RATE_LIMIT_BACKOFF_JITTER", 0.3))  # 30% jitter
+
+# Cloud models - which models are available on which cloud backends
+# Format: "backend_name=model1,model2;backend2=model3,model4"
+# Example: "openai=gpt-4o,gpt-4-turbo;claude=claude-sonnet-4-20250514,claude-3-haiku"
+def _parse_cloud_models(s: str) -> dict:
+    """Parse CLOUD_MODELS env var into {backend_name: [model1, model2, ...]}."""
+    mapping = {}
+    for group in [g.strip() for g in s.split(";") if g.strip()]:
+        if "=" not in group:
+            continue
+        name, models = group.split("=", 1)
+        name = name.strip()
+        model_list = [m.strip() for m in models.split(",") if m.strip()]
+        if name and model_list:
+            mapping[name] = model_list
+    return mapping
+
+CLOUD_MODELS = _parse_cloud_models(os.getenv("CLOUD_MODELS", ""))
+
+
+# Fallback chain configuration
+# Format: "chain_name=backend1>backend2>backend3;chain2=..."
+# Extended format with per-backend options: "backend1(timeout=30,retries=2)>backend2"
+# Example: "default=cloud:openai(timeout=30)>cloud:anthropic(timeout=45)>local:auto"
+from dataclasses import dataclass as dc
+from typing import List as ListType
+
+
+@dc
+class FallbackBackend:
+    """Configuration for a single backend in a fallback chain."""
+    backend: str
+    timeout_secs: float = 30.0
+    max_retries: int = 1
+
+
+def _parse_fallback_chains(s: str) -> dict:
+    """Parse FALLBACK_CHAINS env var into {chain_name: [FallbackBackend, ...]}."""
+    chains = {}
+    for group in [g.strip() for g in s.split(";") if g.strip()]:
+        if "=" not in group:
+            continue
+        name, chain_str = group.split("=", 1)
+        backends = []
+        for part in chain_str.split(">"):
+            part = part.strip()
+            if not part:
+                continue
+            # Parse backend(option=value,...)
+            if "(" in part and part.endswith(")"):
+                backend_name, opts_str = part[:-1].split("(", 1)
+                opts = {}
+                for opt in opts_str.split(","):
+                    if "=" in opt:
+                        k, v = opt.split("=", 1)
+                        opts[k.strip()] = v.strip()
+                backends.append(FallbackBackend(
+                    backend=backend_name.strip(),
+                    timeout_secs=float(opts.get("timeout", 30)),
+                    max_retries=int(opts.get("retries", 1))
+                ))
+            else:
+                backends.append(FallbackBackend(backend=part))
+        if name.strip() and backends:
+            chains[name.strip()] = backends
+    return chains
+
+
+FALLBACK_CHAINS = _parse_fallback_chains(os.getenv("FALLBACK_CHAINS", ""))
+DEFAULT_FALLBACK_CHAIN = os.getenv("DEFAULT_FALLBACK_CHAIN", "")
+FALLBACK_TOTAL_TIMEOUT_SECS = float(os.getenv("FALLBACK_TOTAL_TIMEOUT_SECS", 120))

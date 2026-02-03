@@ -51,6 +51,13 @@ class ConsensusResult:
     agreement_count: int = 0            # How many backends agreed (2 or 3)
     disagreement: bool = False          # True if not unanimous
     comparison_type: str = "unknown"    # "tool_calls" | "text" | "hash"
+    # Oracle support: designated authoritative backend
+    oracle_backend: Optional[str] = None      # Which backend was designated oracle
+    oracle_present: bool = False              # Was oracle in selected backends?
+    oracle_agreed: Optional[bool] = None      # Did oracle agree with majority?
+    # Local vs cloud agreement tracking
+    local_cloud_agreement: Optional[bool] = None  # Did best local vs best cloud agree?
+    local_cloud_similarity: Optional[float] = None  # Similarity score (0.0-1.0)
 
 
 def _normalize_tool_calls(tool_calls: List[Dict]) -> str:
@@ -125,7 +132,10 @@ def _content_hash(response: Dict) -> str:
 
 def compute_consensus(
     results: List[BackendResult],
-    similarity_threshold: float = 0.9
+    similarity_threshold: float = 0.9,
+    oracle_backend: Optional[str] = None,
+    oracle_present: bool = False,
+    is_cloud_fn: Optional[Callable[[str], bool]] = None
 ) -> ConsensusResult:
     """
     Compute consensus from multiple backend results.
@@ -133,9 +143,20 @@ def compute_consensus(
     For tool calls: Compare normalized action name + parameters.
     For text: Compare content hash, fall back to similarity ratio.
 
+    Oracle handling:
+    - If oracle_present=True and oracle_backend in results:
+        - Compare oracle response to majority winner
+        - If oracle disagrees, prefer oracle as winner (it's authoritative)
+    - If oracle_present=False (oracle requested but couldn't be included):
+        - Don't override majority decision
+        - Set oracle_agreed = None (unknown)
+
     Args:
         results: List of BackendResult from different backends
         similarity_threshold: Minimum similarity for text agreement (0.0-1.0)
+        oracle_backend: Which backend is designated oracle (authoritative)
+        oracle_present: Whether the oracle backend was included in the request
+        is_cloud_fn: Optional function to check if a backend is a cloud backend
 
     Returns:
         ConsensusResult with winner and agreement info
@@ -149,17 +170,27 @@ def compute_consensus(
             all_responses=results,
             agreement_count=0,
             disagreement=True,
-            comparison_type="none"
+            comparison_type="none",
+            oracle_backend=oracle_backend,
+            oracle_present=oracle_present,
+            oracle_agreed=None
         )
 
     if len(successful) == 1:
         # Only one success - it wins by default
+        oracle_agreed = None
+        if oracle_present and oracle_backend:
+            oracle_agreed = (successful[0].backend == oracle_backend)
+
         return ConsensusResult(
             winner=successful[0],
             all_responses=results,
             agreement_count=1,
             disagreement=False,
-            comparison_type="single"
+            comparison_type="single",
+            oracle_backend=oracle_backend,
+            oracle_present=oracle_present,
+            oracle_agreed=oracle_agreed
         )
 
     # Check if responses have tool calls
@@ -171,10 +202,95 @@ def compute_consensus(
 
     # Prefer tool call comparison if most responses have tool calls
     if len(tool_call_responses) >= len(successful) // 2 + 1:
-        return _consensus_by_tool_calls(successful, tool_call_responses, results, similarity_threshold)
+        consensus = _consensus_by_tool_calls(successful, tool_call_responses, results, similarity_threshold)
+    else:
+        # Fall back to text comparison
+        consensus = _consensus_by_text(successful, results, similarity_threshold)
 
-    # Fall back to text comparison
-    return _consensus_by_text(successful, results, similarity_threshold)
+    # Apply oracle handling and local/cloud agreement
+    consensus = _apply_oracle_and_local_cloud(
+        consensus, successful, similarity_threshold, oracle_backend, oracle_present, is_cloud_fn
+    )
+
+    return consensus
+
+
+def _apply_oracle_and_local_cloud(
+    consensus: ConsensusResult,
+    successful: List[BackendResult],
+    similarity_threshold: float,
+    oracle_backend: Optional[str],
+    oracle_present: bool,
+    is_cloud_fn: Optional[Callable[[str], bool]]
+) -> ConsensusResult:
+    """Apply oracle handling and compute local vs cloud agreement.
+
+    Args:
+        consensus: The base consensus result from majority voting
+        successful: List of successful results
+        similarity_threshold: Threshold for text similarity comparison
+        oracle_backend: Designated oracle backend
+        oracle_present: Whether oracle was included
+        is_cloud_fn: Function to check if backend is cloud
+
+    Returns:
+        Updated ConsensusResult with oracle and local/cloud fields filled
+    """
+    consensus.oracle_backend = oracle_backend
+    consensus.oracle_present = oracle_present
+
+    # Handle oracle logic
+    if oracle_present and oracle_backend:
+        oracle_result = next((r for r in successful if r.backend == oracle_backend), None)
+        if oracle_result:
+            # Check if oracle agrees with the winner
+            winner_text = _extract_text_content(consensus.winner.response_body) if consensus.winner.response_body else ""
+            oracle_text = _extract_text_content(oracle_result.response_body) if oracle_result.response_body else ""
+
+            similarity = _compute_text_similarity(winner_text, oracle_text)
+            consensus.oracle_agreed = similarity >= similarity_threshold
+
+            # If oracle disagrees, it becomes the winner (authoritative)
+            if not consensus.oracle_agreed:
+                logger.info(
+                    f"Oracle {oracle_backend} disagrees with majority (similarity={similarity:.2f}). "
+                    "Overriding winner with oracle response."
+                )
+                consensus.winner = oracle_result
+                # Recalculate agreement count with oracle as reference
+                oracle_normalized_text = " ".join(oracle_text.split()) if oracle_text else ""
+                new_agreement = 1  # Oracle agrees with itself
+                for r in successful:
+                    if r.backend != oracle_backend:
+                        r_text = _extract_text_content(r.response_body) if r.response_body else ""
+                        if _compute_text_similarity(oracle_normalized_text, r_text) >= similarity_threshold:
+                            new_agreement += 1
+                consensus.agreement_count = new_agreement
+                consensus.disagreement = new_agreement < len(successful)
+        else:
+            # Oracle was supposed to be present but didn't return a successful response
+            consensus.oracle_agreed = None
+    else:
+        consensus.oracle_agreed = None
+
+    # Compute local vs cloud agreement
+    if is_cloud_fn:
+        local_results = [r for r in successful if not is_cloud_fn(r.backend)]
+        cloud_results = [r for r in successful if is_cloud_fn(r.backend)]
+
+        if local_results and cloud_results:
+            # Best = fastest successful response
+            best_local = min(local_results, key=lambda r: r.latency_ms)
+            best_cloud = min(cloud_results, key=lambda r: r.latency_ms)
+
+            local_text = _extract_text_content(best_local.response_body) if best_local.response_body else ""
+            cloud_text = _extract_text_content(best_cloud.response_body) if best_cloud.response_body else ""
+
+            similarity = _compute_text_similarity(local_text, cloud_text)
+            consensus.local_cloud_similarity = similarity
+            consensus.local_cloud_agreement = similarity >= similarity_threshold
+
+    return consensus
 
 
 def _consensus_by_tool_calls(
@@ -403,7 +519,10 @@ class ExecutionEngine:
         self,
         backends: List[str],
         request_fn: Callable[[str], Awaitable[BackendResult]],
-        timeout: float = 60.0
+        timeout: float = 60.0,
+        oracle_backend: Optional[str] = None,
+        oracle_present: bool = False,
+        is_cloud_fn: Optional[Callable[[str], bool]] = None
     ) -> ConsensusResult:
         """
         Execute request on all backends and compute consensus.
@@ -412,9 +531,18 @@ class ExecutionEngine:
             backends: List of backend host:port strings
             request_fn: Async function that takes backend and returns BackendResult
             timeout: Overall timeout in seconds
+            oracle_backend: Which backend is designated oracle (authoritative)
+            oracle_present: Whether the oracle backend was included in the request
+            is_cloud_fn: Optional function to check if a backend is a cloud backend
 
         Returns:
             ConsensusResult with winner and agreement info
         """
         results = await self.execute_all(backends, request_fn, timeout)
-        return compute_consensus(results, self.similarity_threshold)
+        return compute_consensus(
+            results,
+            self.similarity_threshold,
+            oracle_backend=oracle_backend,
+            oracle_present=oracle_present,
+            is_cloud_fn=is_cloud_fn
+        )

@@ -37,11 +37,12 @@ WARM_TIMEOUT_SECS = int(os.getenv("WARM_TIMEOUT_SECS", 120))
 WARM_RETRIES = int(os.getenv("WARM_RETRIES", 1))
 
 # Cloud backend configuration (shared with load balancer)
-# Format: "name=url|api_key,name2=url2|api_key2"
-# Example: "openai=https://api.openai.com/v1|sk-xxx"
+# Format: "name=url|api_key[|provider_type],name2=url2|api_key2[|provider_type]"
+# provider_type is optional, defaults to "openai". Use "anthropic" for Anthropic Claude API.
+# Example: "openai=https://api.openai.com/v1|sk-xxx|openai,claude=https://api.anthropic.com/v1|sk-ant-xxx|anthropic"
 # Cloud backends are registered without probing since cloud APIs don't expose /v1/models the same way
 def _parse_cloud_backends(s: str) -> dict:
-    """Parse CLOUD_BACKENDS env var into {name: {url: str, api_key: str, is_cloud: True}}."""
+    """Parse CLOUD_BACKENDS env var into {name: {url, api_key, provider_type, is_cloud}}."""
     mapping = {}
     for part in [p.strip() for p in s.replace(";", ",").split(",") if p.strip()]:
         if "=" not in part:
@@ -51,13 +52,18 @@ def _parse_cloud_backends(s: str) -> dict:
         rest = rest.strip()
         if "|" not in rest:
             continue
-        url, api_key = rest.rsplit("|", 1)
-        url = url.strip()
-        api_key = api_key.strip()
+        parts = rest.split("|")
+        if len(parts) < 2:
+            continue
+        url = parts[0].strip()
+        api_key = parts[1].strip()
+        # Provider type is optional, defaults to "openai"
+        provider_type = parts[2].strip() if len(parts) > 2 else "openai"
         if name and url and api_key:
             mapping[name] = {
                 "url": url,
                 "api_key": api_key,
+                "provider_type": provider_type,
                 "is_cloud": True,
             }
     return mapping
