@@ -152,12 +152,15 @@ def _is_small_model(model: str) -> bool:
         return False
 
 async def get_eligible_nodes(model_name: str):
-    """Find healthy nodes that advertise the model and meet eligibility: not tripped and under p95 threshold."""
+    """Find healthy nodes that advertise the model and meet eligibility: not tripped, not rate-limited, and under p95 threshold."""
     healthy_nodes = sorted(await redis_client.smembers("nodes:healthy"))
     eligible_nodes = []
     for node in healthy_nodes:
         # Skip nodes on open circuit for this period
         if await _is_circuit_open(node):
+            continue
+        # Skip nodes that are currently rate-limited (429 backoff)
+        if await _is_rate_limited(node):
             continue
         models_json = await redis_client.get(f"node:{node}:models")
         if not models_json:
@@ -388,6 +391,14 @@ class CapacityError(Exception):
         self.scope = scope
         super().__init__(f"{scope} at capacity")
 
+
+class RateLimitError(Exception):
+    """Raised when a backend returns HTTP 429 rate limit response."""
+    def __init__(self, backend: str, retry_after: Optional[float] = None):
+        self.backend = backend
+        self.retry_after = retry_after
+        super().__init__(f"Rate limited by {backend}")
+
 async def _acquire_slot(node: str) -> bool:
     """Atomically increment inflight and enforce optional maxconn.
     If maxconn is set and would be exceeded, revert and return False.
@@ -466,6 +477,74 @@ async def _is_circuit_open(node: str) -> bool:
         return val is not None and val != "0"
     except Exception:
         return False
+
+
+# ---------------------- Rate Limit Backoff Tracking ----------------------
+
+
+async def _record_rate_limit(node: str, retry_after_secs: Optional[float] = None):
+    """Record a rate limit (429) response from a backend.
+
+    Marks the backend as temporarily unhealthy with exponential backoff.
+    Uses Retry-After header value if available, otherwise exponential backoff.
+    """
+    try:
+        # Increment rate limit counter for this node
+        count_key = f"node:{node}:rate_limit_count"
+        count = await redis_client.incrby(count_key, 1)
+        await redis_client.expire(count_key, 300)  # Reset after 5 minutes
+
+        # Calculate backoff duration
+        if retry_after_secs and retry_after_secs > 0:
+            # Use Retry-After from response
+            backoff_secs = min(retry_after_secs, config.RATE_LIMIT_BACKOFF_MAX_SECS)
+        else:
+            # Exponential backoff: base * 2^(count-1)
+            base = config.RATE_LIMIT_BACKOFF_BASE_SECS
+            max_backoff = config.RATE_LIMIT_BACKOFF_MAX_SECS
+            backoff_secs = min(base * (2 ** (count - 1)), max_backoff)
+
+        # Add jitter (±jitter%)
+        jitter_range = backoff_secs * config.RATE_LIMIT_BACKOFF_JITTER
+        jitter = random.uniform(-jitter_range, jitter_range)
+        backoff_secs = max(0.1, backoff_secs + jitter)
+
+        # Mark backend as rate-limited (temporary unhealthy state)
+        limit_key = f"node:{node}:rate_limited"
+        await redis_client.set(limit_key, "1")
+        await redis_client.expire(limit_key, int(backoff_secs) + 1)
+
+        # Track metrics
+        await redis_client.incrby("lb:rate_limits_total", 1)
+        await redis_client.incrby(f"lb:rate_limits:{node}", 1)
+
+        logger.warning(
+            "[rate_limit] Backend %s rate limited, backing off for %.1f seconds (count: %d)",
+            node, backoff_secs, count
+        )
+    except Exception as e:
+        logger.warning("[rate_limit] Failed to record rate limit for %s: %s", node, e)
+
+
+async def _is_rate_limited(node: str) -> bool:
+    """Check if a backend is currently rate-limited and in backoff."""
+    try:
+        val = await redis_client.get(f"node:{node}:rate_limited")
+        return val is not None and val != "0"
+    except Exception:
+        return False
+
+
+async def _clear_rate_limit(node: str):
+    """Clear rate limit state for a backend after successful request."""
+    try:
+        # Clear the rate-limited flag
+        await redis_client.delete(f"node:{node}:rate_limited")
+        # Reset the count (on success, we reset exponential backoff)
+        await redis_client.delete(f"node:{node}:rate_limit_count")
+    except Exception:
+        pass
+
 
 async def _inc_requests_total():
     try:
@@ -638,6 +717,65 @@ def _get_backend_alias(host_port: str) -> Optional[str]:
     return reverse.get(host_port)
 
 
+def _is_cloud_backend(node: str) -> bool:
+    """Check if a node is a cloud backend (node address starts with 'cloud:')."""
+    return node.startswith("cloud:")
+
+
+def _get_cloud_backend_name(node: str) -> Optional[str]:
+    """Extract cloud backend name from node address (e.g., 'cloud:openai' -> 'openai')."""
+    if not _is_cloud_backend(node):
+        return None
+    return node.split(":", 1)[1] if ":" in node else None
+
+
+def _get_cloud_config(node: str) -> Optional[Dict[str, Any]]:
+    """Get cloud backend configuration for a node."""
+    name = _get_cloud_backend_name(node)
+    if not name:
+        return None
+    cloud_backends = getattr(config, "CLOUD_BACKENDS", {}) or {}
+    return cloud_backends.get(name)
+
+
+def _get_cloud_url(node: str, endpoint: str = "/chat/completions") -> Optional[str]:
+    """Get the full URL for a cloud backend endpoint.
+
+    Args:
+        node: Cloud node address (e.g., 'cloud:openai')
+        endpoint: API endpoint path (e.g., '/chat/completions')
+
+    Returns:
+        Full URL (e.g., 'https://api.openai.com/v1/chat/completions') or None
+    """
+    cfg = _get_cloud_config(node)
+    if not cfg:
+        return None
+    base_url = cfg.get("url", "").rstrip("/")
+    if not base_url:
+        return None
+    return f"{base_url}{endpoint}"
+
+
+def _get_cloud_headers(node: str, headers: Dict[str, str]) -> Dict[str, str]:
+    """Inject cloud API key into headers for a cloud backend request.
+
+    Returns updated headers dict with Authorization header set.
+    """
+    cfg = _get_cloud_config(node)
+    if not cfg:
+        return headers
+
+    api_key = cfg.get("api_key", "")
+    if not api_key:
+        return headers
+
+    # Create new headers dict to avoid mutating original
+    updated = dict(headers)
+    updated["Authorization"] = f"Bearer {api_key}"
+    return updated
+
+
 def _get_equivalent_models(model_name: str) -> List[str]:
     """Get all equivalent model names for a given model.
 
@@ -753,8 +891,22 @@ async def _make_backend_request(
     backend_model_override: Optional[str] = None
 ) -> BackendResult:
     """Make a single non-streaming request to a backend and return result."""
-    url = f"http://{backend}/v1/chat/completions"
-    alias = _get_backend_alias(backend)
+    # Determine URL based on backend type (cloud vs local)
+    if _is_cloud_backend(backend):
+        url = _get_cloud_url(backend, "/chat/completions")
+        if not url:
+            return BackendResult(
+                backend=backend,
+                alias=_get_cloud_backend_name(backend),
+                error="Cloud backend URL not configured"
+            )
+        # Inject API key for cloud backends
+        headers = _get_cloud_headers(backend, headers)
+        alias = _get_cloud_backend_name(backend)
+    else:
+        url = f"http://{backend}/v1/chat/completions"
+        alias = _get_backend_alias(backend)
+
     result = BackendResult(backend=backend, alias=alias)
     t0 = time.monotonic()
 
@@ -783,11 +935,25 @@ async def _make_backend_request(
             result.status_code = resp.status_code
             result.first_byte_ms = (time.monotonic() - t0) * 1000
 
-            if resp.status_code >= 500 or resp.status_code == 404:
+            # Handle rate limiting (429)
+            if resp.status_code == 429:
+                # Extract Retry-After header if present
+                retry_after = resp.headers.get("retry-after")
+                retry_after_secs = None
+                if retry_after:
+                    try:
+                        retry_after_secs = float(retry_after)
+                    except ValueError:
+                        pass
+                await _record_rate_limit(backend, retry_after_secs)
+                result.error = f"HTTP 429 Rate Limited"
+            elif resp.status_code >= 500 or resp.status_code == 404:
                 await _record_failure(backend)
                 result.error = f"HTTP {resp.status_code}"
             else:
                 await _record_success(backend)
+                # Clear any previous rate limit state on success
+                await _clear_rate_limit(backend)
                 result.success = True
                 try:
                     result.response_body = resp.json()
@@ -799,7 +965,18 @@ async def _make_backend_request(
                 result.status_code = getattr(response, "status_code", 200)
                 result.first_byte_ms = (time.monotonic() - t0) * 1000
 
-                if result.status_code >= 500 or result.status_code == 404:
+                # Handle rate limiting (429)
+                if result.status_code == 429:
+                    retry_after = getattr(response, "headers", {}).get("retry-after")
+                    retry_after_secs = None
+                    if retry_after:
+                        try:
+                            retry_after_secs = float(retry_after)
+                        except ValueError:
+                            pass
+                    await _record_rate_limit(backend, retry_after_secs)
+                    result.error = f"HTTP 429 Rate Limited"
+                elif result.status_code >= 500 or result.status_code == 404:
                     await _record_failure(backend)
                     result.error = f"HTTP {result.status_code}"
                 else:
@@ -807,6 +984,7 @@ async def _make_backend_request(
                     async for chunk in response.aiter_bytes():
                         chunks.extend(chunk)
                     await _record_success(backend)
+                    await _clear_rate_limit(backend)
                     result.success = True
                     try:
                         result.response_body = json.loads(bytes(chunks))
@@ -1231,7 +1409,16 @@ async def chat_completions(request: Request):
     session_id = request.headers.get("x-session-id")
 
     async def attempt_stream(node: str):
-        url = f"http://{node}/v1/chat/completions"
+        # Determine URL and headers based on backend type (cloud vs local)
+        if _is_cloud_backend(node):
+            url = _get_cloud_url(node, "/chat/completions")
+            if not url:
+                raise httpx.RequestError(f"Cloud backend URL not configured for {node}")
+            req_headers = _get_cloud_headers(node, headers)
+        else:
+            url = f"http://{node}/v1/chat/completions"
+            req_headers = headers
+
         logger.info("[req=%s] Routing request for model '%s' to %s", request_id, model_name, node)
         acquired = await _acquire_slot(node)
         if not acquired:
@@ -1242,7 +1429,18 @@ async def chat_completions(request: Request):
             await _dec_inflight(node)
             raise CapacityError("model")
         try:
-            async with http_client.stream("POST", url, json=body, headers=headers) as response:
+            async with http_client.stream("POST", url, json=body, headers=req_headers) as response:
+                # Handle rate limiting (429)
+                if response.status_code == 429:
+                    retry_after = response.headers.get("retry-after")
+                    retry_after_secs = None
+                    if retry_after:
+                        try:
+                            retry_after_secs = float(retry_after)
+                        except ValueError:
+                            pass
+                    await _record_rate_limit(node, retry_after_secs)
+                    raise RateLimitError(node, retry_after_secs)
                 # Treat 5xx and 404 as retryable failure across nodes
                 if response.status_code and (response.status_code >= 500 or response.status_code == 404):
                     await _record_failure(node)
@@ -1250,6 +1448,7 @@ async def chat_completions(request: Request):
                 async for chunk in response.aiter_bytes():
                     yield chunk
             await _record_success(node)
+            await _clear_rate_limit(node)
         finally:
             await _dec_inflight(node)
             await _dec_model(model_name)
@@ -1370,7 +1569,7 @@ async def chat_completions(request: Request):
                         except Exception:
                             pass
                         return
-                    except (asyncio.TimeoutError, StopAsyncIteration, httpx.RequestError, httpx.HTTPStatusError, CapacityError):
+                    except (asyncio.TimeoutError, StopAsyncIteration, httpx.RequestError, httpx.HTTPStatusError, CapacityError, RateLimitError):
                         # Announce hedge start
                         evt = {
                             "request_id": request_id,
@@ -1504,7 +1703,7 @@ async def chat_completions(request: Request):
                     except Exception:
                         pass
                     return
-            except (httpx.RequestError, httpx.HTTPStatusError, CapacityError) as e:
+            except (httpx.RequestError, httpx.HTTPStatusError, CapacityError, RateLimitError) as e:
                 logger.warning("[req=%s] Upstream error from %s: %s (attempt %d/%d)", request_id, candidate, e, attempts, budget)
                 await _record_failure(candidate)
                 last_error = e
@@ -1536,7 +1735,7 @@ async def chat_completions(request: Request):
                     async for data in attempt_stream(forced_node):
                         yield data
                     await _set_sticky_node(session_id, model_name, forced_node)
-                except (httpx.RequestError, httpx.HTTPStatusError, CapacityError) as e:
+                except (httpx.RequestError, httpx.HTTPStatusError, CapacityError, RateLimitError) as e:
                     err = {"error": {"message": f"Upstream error from {forced_node}: {e}"}}
                     yield json.dumps(err).encode()
             return StreamingResponse(stream_single(), media_type="text/event-stream", headers={
@@ -1607,7 +1806,16 @@ async def chat_completions(request: Request):
 
     # Non-streaming behavior: aggregate JSON and return a Response
     async def attempt_request(node: str):
-        url = f"http://{node}/v1/chat/completions"
+        # Determine URL and headers based on backend type (cloud vs local)
+        if _is_cloud_backend(node):
+            url = _get_cloud_url(node, "/chat/completions")
+            if not url:
+                raise httpx.RequestError(f"Cloud backend URL not configured for {node}")
+            req_headers = _get_cloud_headers(node, headers)
+        else:
+            url = f"http://{node}/v1/chat/completions"
+            req_headers = headers
+
         logger.info("[req=%s] Routing (non-stream) request for model '%s' to %s", request_id, model_name, node)
         acquired = await _acquire_slot(node)
         if not acquired:
@@ -1619,14 +1827,20 @@ async def chat_completions(request: Request):
             raise CapacityError("model")
         try:
             try:
-                resp = await http_client.post(url, json=body, headers=headers)
+                resp = await http_client.post(url, json=body, headers=req_headers)
                 status_code = resp.status_code
                 content = resp.content
                 ctype = resp.headers.get("content-type", "application/json")
             except AttributeError:
                 # Compatibility for test fakes that implement only `.stream(...)`
-                async with http_client.stream("POST", url, json=body, headers=headers) as response:
+                async with http_client.stream("POST", url, json=body, headers=req_headers) as response:
                     status_code = getattr(response, "status_code", 200)
+                    # Handle rate limiting (429)
+                    if status_code == 429:
+                        retry_after = getattr(response, "headers", {}).get("retry-after")
+                        retry_after_secs = float(retry_after) if retry_after else None
+                        await _record_rate_limit(node, retry_after_secs)
+                        raise RateLimitError(node, retry_after_secs)
                     # Treat 5xx and 404 as retryable across nodes (LM Studio variants sometimes 404 chat endpoint)
                     if status_code and (status_code >= 500 or status_code == 404):
                         await _record_failure(node)
@@ -1636,11 +1850,18 @@ async def chat_completions(request: Request):
                         chunks.extend(chunk)
                     content = bytes(chunks)
                     ctype = "application/json"
+            # Handle rate limiting (429)
+            if status_code == 429:
+                retry_after = resp.headers.get("retry-after")
+                retry_after_secs = float(retry_after) if retry_after else None
+                await _record_rate_limit(node, retry_after_secs)
+                raise RateLimitError(node, retry_after_secs)
             # Evaluate retry conditions for normal client path
             if status_code and (status_code >= 500 or status_code == 404):
                 await _record_failure(node)
                 raise httpx.HTTPStatusError("Upstream retryable error", request=None, response=None)
             await _record_success(node)
+            await _clear_rate_limit(node)
             out = Response(content=content, media_type=ctype, status_code=status_code)
             out.headers["x-selected-model"] = model_name
             out.headers["x-routed-node"] = node
@@ -1662,7 +1883,7 @@ async def chat_completions(request: Request):
         try:
             await _inc_requests_total()
             return await attempt_request(forced_node)
-        except (httpx.RequestError, httpx.HTTPStatusError, CapacityError) as e:
+        except (httpx.RequestError, httpx.HTTPStatusError, CapacityError, RateLimitError) as e:
             raise HTTPException(status_code=502, detail=f"Upstream error from {forced_node}: {e}")
 
     # Failover loop (non-stream)
@@ -1721,7 +1942,7 @@ async def chat_completions(request: Request):
                         except Exception:
                             pass
                         return resp
-                    except (httpx.RequestError, httpx.HTTPStatusError, CapacityError):
+                    except (httpx.RequestError, httpx.HTTPStatusError, CapacityError, RateLimitError):
                         # Immediate hedge to secondary
                         try:
                             await redis_client.incrby("lb:hedges_total", 1)
@@ -1841,7 +2062,7 @@ async def chat_completions(request: Request):
                                     tried.add(secondary)
                                     tried_order.append(secondary)
                                     continue
-                except (httpx.RequestError, httpx.HTTPStatusError, CapacityError) as e:
+                except (httpx.RequestError, httpx.HTTPStatusError, CapacityError, RateLimitError) as e:
                     # Primary threw before delay elapsed; treat as normal failure (no hedge launched)
                     await _record_failure(candidate)
                     last_error = e
@@ -1863,7 +2084,7 @@ async def chat_completions(request: Request):
             except Exception:
                 pass
             return resp
-        except (httpx.RequestError, httpx.HTTPStatusError, CapacityError) as e:
+        except (httpx.RequestError, httpx.HTTPStatusError, CapacityError, RateLimitError) as e:
             logger.warning("[req=%s] Chat (non-stream) upstream error from %s: %s (attempt %d/%d)", request_id, candidate, e, attempts, budget)
             await _record_failure(candidate)
             last_error = e
@@ -1968,7 +2189,16 @@ async def embeddings(request: Request):
     session_id = request.headers.get("x-session-id")
 
     async def attempt_request(node: str):
-        url = f"http://{node}/v1/embeddings"
+        # Determine URL and headers based on backend type (cloud vs local)
+        if _is_cloud_backend(node):
+            url = _get_cloud_url(node, "/embeddings")
+            if not url:
+                raise httpx.RequestError(f"Cloud backend URL not configured for {node}")
+            req_headers = _get_cloud_headers(node, headers)
+        else:
+            url = f"http://{node}/v1/embeddings"
+            req_headers = headers
+
         logger.info("[req=%s] Routing embeddings request for model '%s' to %s", request_id, model_name, node)
         acquired = await _acquire_slot(node)
         if not acquired:
@@ -1980,14 +2210,20 @@ async def embeddings(request: Request):
             raise CapacityError("model")
         try:
             try:
-                resp = await http_client.post(url, json=body, headers=headers)
+                resp = await http_client.post(url, json=body, headers=req_headers)
                 status_code = resp.status_code
                 content = resp.content
                 ctype = resp.headers.get("content-type", "application/json")
             except AttributeError:
                 # Compatibility path for fakes
-                async with http_client.stream("POST", url, json=body, headers=headers) as response:
+                async with http_client.stream("POST", url, json=body, headers=req_headers) as response:
                     status_code = getattr(response, "status_code", 200)
+                    # Handle rate limiting (429)
+                    if status_code == 429:
+                        retry_after = getattr(response, "headers", {}).get("retry-after")
+                        retry_after_secs = float(retry_after) if retry_after else None
+                        await _record_rate_limit(node, retry_after_secs)
+                        raise RateLimitError(node, retry_after_secs)
                     if status_code and status_code >= 500:
                         await _record_failure(node)
                         raise httpx.HTTPStatusError("Upstream 5xx", request=None, response=None)
@@ -1996,10 +2232,17 @@ async def embeddings(request: Request):
                         chunks.extend(chunk)
                     content = bytes(chunks)
                     ctype = "application/json"
+            # Handle rate limiting (429)
+            if status_code == 429:
+                retry_after = resp.headers.get("retry-after")
+                retry_after_secs = float(retry_after) if retry_after else None
+                await _record_rate_limit(node, retry_after_secs)
+                raise RateLimitError(node, retry_after_secs)
             if status_code and status_code >= 500:
                 await _record_failure(node)
                 raise httpx.HTTPStatusError("Upstream 5xx", request=None, response=None)
             await _record_success(node)
+            await _clear_rate_limit(node)
             out = Response(content=content, media_type=ctype, status_code=status_code)
             out.headers["x-selected-model"] = model_name
             out.headers["x-routed-node"] = node
@@ -2063,7 +2306,7 @@ async def embeddings(request: Request):
             except Exception:
                 pass
             return resp
-        except (httpx.RequestError, httpx.HTTPStatusError, CapacityError) as e:
+        except (httpx.RequestError, httpx.HTTPStatusError, CapacityError, RateLimitError) as e:
             logger.warning("[req=%s] Embeddings upstream error from %s: %s (attempt %d/%d)", request_id, candidate, e, attempts, budget)
             await _record_failure(candidate)
             last_error = e
@@ -2141,6 +2384,20 @@ async def metrics():
         mf = await redis_client.get(f"lb:model:{m}:failovers_total")
         if mf:
             lines.append(f'ai_lb_failovers_total{{model="{m}"}} {int(mf)}')
+
+    # Rate limit metrics
+    lines.append("# HELP ai_lb_rate_limits_total Total rate limit (429) responses")
+    lines.append("# TYPE ai_lb_rate_limits_total counter")
+    rate_limits_total = await redis_client.get("lb:rate_limits_total")
+    lines.append(f"ai_lb_rate_limits_total {int(rate_limits_total) if rate_limits_total else 0}")
+
+    # Per-node rate limits
+    lines.append("# HELP ai_lb_rate_limits Rate limit counts per node")
+    lines.append("# TYPE ai_lb_rate_limits counter")
+    for n in healthy:
+        rl = await redis_client.get(f"lb:rate_limits:{n}")
+        if rl:
+            lines.append(f'ai_lb_rate_limits{{node="{n}"}} {int(rl)}')
 
     # Hedging metrics
     lines.append("# HELP ai_lb_hedges_total Total hedged duplicate attempts")

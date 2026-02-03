@@ -1,4 +1,5 @@
 import asyncio
+import json
 import httpx
 import redis.asyncio as redis
 import config
@@ -92,13 +93,69 @@ async def warm_models(redis_client: redis.Redis, session: httpx.AsyncClient, nod
         except Exception:
             pass
 
+async def register_cloud_backends(redis_client: redis.Redis):
+    """
+    Register cloud backends from config without probing.
+    Cloud APIs don't expose /v1/models the same way as local backends.
+    """
+    cloud_backends = getattr(config, "CLOUD_BACKENDS", {}) or {}
+    cloud_models = getattr(config, "CLOUD_MODELS", {}) or {}
+
+    if not cloud_backends:
+        return
+
+    print(f"Registering {len(cloud_backends)} cloud backend(s)...")
+
+    for name, backend_config in cloud_backends.items():
+        url = backend_config.get("url", "")
+        if not url:
+            continue
+
+        # Extract host:port from URL for node addressing
+        # URL format: https://api.openai.com/v1 -> use name as identifier
+        # We use the backend name as the node identifier for cloud backends
+        node_address = f"cloud:{name}"
+
+        # Get models for this backend
+        models = cloud_models.get(name, [])
+
+        # Build models list in OpenAI format
+        models_data = {
+            "object": "list",
+            "data": [
+                {"id": model, "object": "model", "owned_by": name}
+                for model in models
+            ]
+        }
+
+        try:
+            async with redis_client.pipeline() as pipe:
+                pipe.sadd("nodes:healthy", node_address)
+                pipe.set(f"node:{node_address}:models", json.dumps(models_data))
+                pipe.set(f"node:{node_address}:is_cloud", "1")
+                pipe.set(f"node:{node_address}:cloud_name", name)
+                pipe.set(f"node:{node_address}:cloud_url", url)
+                # Cloud backends typically don't have concurrency limits enforced here
+                # Set expiry same as other nodes
+                pipe.expire("nodes:healthy", KEY_EXPIRY_SECONDS)
+                pipe.expire(f"node:{node_address}:models", KEY_EXPIRY_SECONDS)
+                pipe.expire(f"node:{node_address}:is_cloud", KEY_EXPIRY_SECONDS)
+                pipe.expire(f"node:{node_address}:cloud_name", KEY_EXPIRY_SECONDS)
+                pipe.expire(f"node:{node_address}:cloud_url", KEY_EXPIRY_SECONDS)
+                await pipe.execute()
+
+            print(f"☁️  Registered cloud backend: {node_address} with {len(models)} model(s): {models}")
+        except Exception as e:
+            print(f"Error registering cloud backend {name}: {e}")
+
+
 async def main():
     """
     Main monitoring loop.
     """
     print("Monitor service started.")
     print(f"Connecting to Redis at {config.REDIS_HOST}:{config.REDIS_PORT}")
-    
+
     redis_client = redis.Redis(host=config.REDIS_HOST, port=config.REDIS_PORT, decode_responses=True)
 
     try:
@@ -134,7 +191,10 @@ async def main():
     async with httpx.AsyncClient(timeout=CLIENT_TIMEOUT) as session:
         while True:
             print("--- Starting network scan ---")
-            
+
+            # Register cloud backends (no probing needed)
+            await register_cloud_backends(redis_client)
+
             # Create a list of tasks for all hosts and ports to check
             tasks = []
             for host, port in pairs:

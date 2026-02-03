@@ -1,7 +1,7 @@
 # Engineering Backlog
 
 ## High Priority
-- [ ] **Infrastructure**: Add rate-limit handling for Cloud Providers (currently prints error, should backoff/retry).
+- [x] **Infrastructure**: Add rate-limit handling for Cloud Providers (currently prints error, should backoff/retry). ✅ Implemented with exponential backoff, jitter, and Retry-After header support.
 
 ## Medium Priority (Reliability)
 - [ ] **Worker**: Implement Type Coercion for MCP Tools.

@@ -177,3 +177,36 @@ MODEL_EQUIVALENTS_REVERSE = {}
 for canonical, models in MODEL_EQUIVALENTS.items():
     for m in models:
         MODEL_EQUIVALENTS_REVERSE[m] = canonical
+
+# Cloud backend configuration
+# Format: "name=url|api_key,name2=url2|api_key2" or semicolon-separated
+# Example: "openai=https://api.openai.com/v1|sk-xxx,anthropic=https://api.anthropic.com/v1|sk-ant-xxx"
+# URL should include /v1 path for OpenAI-compatible endpoints
+def _parse_cloud_backends(s: str) -> dict:
+    """Parse CLOUD_BACKENDS env var into {name: {url: str, api_key: str, is_cloud: True}}."""
+    mapping = {}
+    for part in [p.strip() for p in s.replace(";", ",").split(",") if p.strip()]:
+        if "=" not in part:
+            continue
+        name, rest = part.split("=", 1)
+        name = name.strip()
+        rest = rest.strip()
+        if "|" not in rest:
+            continue
+        url, api_key = rest.rsplit("|", 1)
+        url = url.strip()
+        api_key = api_key.strip()
+        if name and url and api_key:
+            mapping[name] = {
+                "url": url,
+                "api_key": api_key,
+                "is_cloud": True,
+            }
+    return mapping
+
+CLOUD_BACKENDS = _parse_cloud_backends(os.getenv("CLOUD_BACKENDS", ""))
+
+# Rate limiting configuration for cloud backends
+RATE_LIMIT_BACKOFF_BASE_SECS = float(os.getenv("RATE_LIMIT_BACKOFF_BASE_SECS", 1.0))
+RATE_LIMIT_BACKOFF_MAX_SECS = float(os.getenv("RATE_LIMIT_BACKOFF_MAX_SECS", 60.0))
+RATE_LIMIT_BACKOFF_JITTER = float(os.getenv("RATE_LIMIT_BACKOFF_JITTER", 0.3))  # 30% jitter

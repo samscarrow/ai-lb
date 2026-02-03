@@ -35,3 +35,49 @@ WARM_MODELS_RAW = os.getenv("WARM_MODELS", "")
 WARM_MODELS = [m.strip() for m in WARM_MODELS_RAW.replace(";", ",").split(",") if m.strip()]
 WARM_TIMEOUT_SECS = int(os.getenv("WARM_TIMEOUT_SECS", 120))
 WARM_RETRIES = int(os.getenv("WARM_RETRIES", 1))
+
+# Cloud backend configuration (shared with load balancer)
+# Format: "name=url|api_key,name2=url2|api_key2"
+# Example: "openai=https://api.openai.com/v1|sk-xxx"
+# Cloud backends are registered without probing since cloud APIs don't expose /v1/models the same way
+def _parse_cloud_backends(s: str) -> dict:
+    """Parse CLOUD_BACKENDS env var into {name: {url: str, api_key: str, is_cloud: True}}."""
+    mapping = {}
+    for part in [p.strip() for p in s.replace(";", ",").split(",") if p.strip()]:
+        if "=" not in part:
+            continue
+        name, rest = part.split("=", 1)
+        name = name.strip()
+        rest = rest.strip()
+        if "|" not in rest:
+            continue
+        url, api_key = rest.rsplit("|", 1)
+        url = url.strip()
+        api_key = api_key.strip()
+        if name and url and api_key:
+            mapping[name] = {
+                "url": url,
+                "api_key": api_key,
+                "is_cloud": True,
+            }
+    return mapping
+
+CLOUD_BACKENDS = _parse_cloud_backends(os.getenv("CLOUD_BACKENDS", ""))
+
+# Cloud models configuration - which models to advertise for each cloud backend
+# Format: "backend_name=model1,model2,model3;backend_name2=modelA,modelB"
+# Example: "openai=gpt-4o,gpt-4o-mini,gpt-3.5-turbo;anthropic=claude-sonnet-4-20250514"
+def _parse_cloud_models(s: str) -> dict:
+    """Parse CLOUD_MODELS env var into {backend_name: [model1, model2, ...]}."""
+    mapping = {}
+    for group in [g.strip() for g in s.split(";") if g.strip()]:
+        if "=" not in group:
+            continue
+        name, models_str = group.split("=", 1)
+        name = name.strip()
+        models = [m.strip() for m in models_str.split(",") if m.strip()]
+        if name and models:
+            mapping[name] = models
+    return mapping
+
+CLOUD_MODELS = _parse_cloud_models(os.getenv("CLOUD_MODELS", ""))
