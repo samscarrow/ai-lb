@@ -74,7 +74,9 @@ class OpenAIAdapter(ProviderAdapter):
     """OpenAI and OpenAI-compatible providers."""
 
     def get_headers(self, api_key: str, base_headers: Dict[str, str]) -> Dict[str, str]:
-        headers = dict(base_headers)
+        # Filter out headers that we'll set explicitly (case-insensitive)
+        skip_headers = {'content-type', 'accept', 'authorization'}
+        headers = {k: v for k, v in base_headers.items() if k.lower() not in skip_headers}
         # Provider-specific base headers
         headers["Content-Type"] = "application/json"
         headers["Accept"] = "application/json"
@@ -90,7 +92,9 @@ class AnthropicAdapter(ProviderAdapter):
     """
 
     def get_headers(self, api_key: str, base_headers: Dict[str, str]) -> Dict[str, str]:
-        headers = dict(base_headers)
+        # Filter out headers that we'll set explicitly (case-insensitive)
+        skip_headers = {'content-type', 'accept', 'authorization', 'x-api-key'}
+        headers = {k: v for k, v in base_headers.items() if k.lower() not in skip_headers}
         # Provider-specific base headers
         headers["Content-Type"] = "application/json"
         headers["Accept"] = "application/json"

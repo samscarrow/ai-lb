@@ -153,8 +153,11 @@ def _is_small_model(model: str) -> bool:
     except Exception:
         return False
 
-async def get_eligible_nodes(model_name: str):
-    """Find healthy nodes that advertise the model and meet eligibility: not tripped, not rate-limited, and under p95 threshold."""
+async def get_eligible_nodes(model_name: str, include_cloud: bool = True):
+    """Find healthy nodes that advertise the model and meet eligibility: not tripped, not rate-limited, and under p95 threshold.
+
+    When include_cloud=True, also includes cloud backends that support the model.
+    """
     healthy_nodes = sorted(await redis_client.smembers("nodes:healthy"))
     eligible_nodes = []
     for node in healthy_nodes:
@@ -189,6 +192,12 @@ async def get_eligible_nodes(model_name: str):
                         # Defer: skip node until it recovers
                         continue
             eligible_nodes.append(node)
+
+    # Add eligible cloud backends
+    if include_cloud:
+        cloud_nodes = await _get_eligible_cloud_backends(model_name)
+        eligible_nodes.extend(cloud_nodes)
+
     return eligible_nodes
 
 async def _aggregate_models() -> list:
