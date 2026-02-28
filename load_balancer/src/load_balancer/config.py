@@ -287,3 +287,56 @@ def _parse_fallback_chains(s: str) -> dict:
 FALLBACK_CHAINS = _parse_fallback_chains(os.getenv("FALLBACK_CHAINS", ""))
 DEFAULT_FALLBACK_CHAIN = os.getenv("DEFAULT_FALLBACK_CHAIN", "")
 FALLBACK_TOTAL_TIMEOUT_SECS = float(os.getenv("FALLBACK_TOTAL_TIMEOUT_SECS", 120))
+
+
+# ---------------------------------------------------------------------------
+# Backend capability tags (inspired by Perplexity Computer model specialization)
+# Maps backend name → frozenset of capability strings.
+# Cloud backends: use the cloud name ("openai", "claude", "gemini").
+# Local backends: use host:port.
+# Format: "openai=reasoning,code;gemini=research,multimodal;localhost:11434=fast,private"
+# Available capability tags (convention, not enforced):
+#   reasoning, code, research, multimodal, creative, math, fast, private, long-context
+# Inspiration: Perplexity Computer (multi-model specialization), Apache-2.0
+# ---------------------------------------------------------------------------
+def _parse_backend_capabilities(s: str) -> dict:
+    """Parse BACKEND_CAPABILITIES env var into {backend_name: frozenset of caps}.
+
+    Accepts semicolons or pipes as entry separators; commas separate capabilities.
+    Cloud backend names with a "cloud:" prefix are normalized (prefix stripped)
+    so that lookups from main.py work consistently.
+    Capability matching is case-sensitive — no lowercasing is applied.
+    """
+    mapping: dict = {}
+    # Pipes are accepted as an alternative separator to semicolons
+    for group in [g.strip() for g in s.replace("|", ";").split(";") if g.strip()]:
+        if "=" not in group:
+            continue
+        name, caps_str = group.split("=", 1)
+        name = name.strip()
+        # Strip "cloud:" prefix so keys always match the bare backend name
+        if name.startswith("cloud:"):
+            name = name[len("cloud:"):]
+        # Case-sensitive: no .lower() applied to capability strings
+        cap_list = frozenset(c.strip() for c in caps_str.split(",") if c.strip())
+        if name and cap_list:
+            mapping[name] = cap_list
+    return mapping
+
+
+BACKEND_CAPABILITIES: dict = _parse_backend_capabilities(os.getenv("BACKEND_CAPABILITIES", ""))
+
+# ---------------------------------------------------------------------------
+# PLAN execution mode (Perplexity Computer-style multi-step orchestration)
+# PLANNER_BACKEND: cloud backend name or host:port used to decompose tasks.
+# ---------------------------------------------------------------------------
+PLANNER_BACKEND: str = os.getenv("PLANNER_BACKEND", "")
+PLAN_MAX_SUBTASKS: int = int(os.getenv("PLAN_MAX_SUBTASKS", "5"))
+PLAN_SUBTASK_TIMEOUT_SECS: float = float(os.getenv("PLAN_SUBTASK_TIMEOUT_SECS", "30.0"))
+
+# ---------------------------------------------------------------------------
+# Complexity-based routing (inspired by RouteLLM, Apache-2.0 — lm-sys/RouteLLM)
+# When enabled, prompt complexity is scored and MODEL_CLASSES tiers are used
+# to automatically select small/medium/large model pools for sentinel requests.
+# ---------------------------------------------------------------------------
+COMPLEXITY_ROUTING_ENABLED: bool = os.getenv("COMPLEXITY_ROUTING_ENABLED", "false").lower() in ("1", "true", "yes")

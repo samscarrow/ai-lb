@@ -14,13 +14,15 @@ from contextlib import asynccontextmanager
 
 from . import config
 from .request_validation import sanitize_chat_request, sanitize_embeddings_request
-from .routing.strategies import get_routing_strategy
+from .routing.strategies import get_routing_strategy, ComplexityRoutingStrategy
 from .execution import (
     ExecutionMode,
     ExecutionConfig,
     BackendResult,
     ConsensusResult,
     ExecutionEngine,
+    PlanTask,
+    PlanResult,
 )
 from .providers import get_adapter
 
@@ -659,11 +661,13 @@ async def _set_sticky_node(session_id: Optional[str], model_name: str, node: str
 
 @dataclass
 class ExtendedExecutionConfig:
-    """Extended execution config with oracle and fallback chain support."""
+    """Extended execution config with oracle, fallback chain, and capability support."""
     base: ExecutionConfig
     # Oracle configuration for consensus mode
     oracle_backend: Optional[str] = None  # Validated oracle backend (e.g., "cloud:openai")
     oracle_valid: bool = True  # Whether the oracle header was valid
+    # Capability filtering — only route to backends with these capability tags
+    required_capabilities: Optional[frozenset] = None  # e.g. frozenset({"research", "code"})
     # Fallback chain configuration
     fallback_chain: Optional[str] = None  # Name of fallback chain to use
 
@@ -767,6 +771,16 @@ def _parse_execution_mode(request: Request) -> Optional[ExtendedExecutionConfig]
             oracle_valid = False  # Unknown backend key
             logger.warning(f"Invalid oracle backend: {oracle_raw}")
 
+    # Parse capability requirements (x-require-capability: research,code)
+    # Inspired by Perplexity Computer capability-specialized routing
+    # Case-sensitive — no lowercasing so that tags like "GPU" vs "gpu" are distinct
+    cap_raw = request.headers.get("x-require-capability")
+    required_capabilities = None
+    if cap_raw:
+        required_capabilities = frozenset(
+            c.strip() for c in cap_raw.split(",") if c.strip()
+        )
+
     return ExtendedExecutionConfig(
         base=ExecutionConfig(
             mode=mode,
@@ -775,7 +789,8 @@ def _parse_execution_mode(request: Request) -> Optional[ExtendedExecutionConfig]
             timeout_secs=timeout_secs
         ),
         oracle_backend=oracle,
-        oracle_valid=oracle_valid
+        oracle_valid=oracle_valid,
+        required_capabilities=required_capabilities,
     )
 
 
@@ -794,6 +809,62 @@ def _get_backend_alias(host_port: str) -> Optional[str]:
 def _is_cloud_backend(node: str) -> bool:
     """Check if a node is a cloud backend (node address starts with 'cloud:')."""
     return node.startswith("cloud:")
+
+
+def _backend_has_capabilities(node: str, required: frozenset) -> bool:
+    """Return True if backend node has all required capability tags.
+
+    Cloud backends are looked up by their name (strip "cloud:" prefix).
+    Local backends are looked up by host:port.
+
+    Inspired by Perplexity Computer model specialization — capability-typed pools.
+    """
+    if not required:
+        return True
+    caps_map = getattr(config, "BACKEND_CAPABILITIES", {}) or {}
+    key = node.replace("cloud:", "") if node.startswith("cloud:") else node
+    backend_caps = caps_map.get(key, frozenset())
+    return required.issubset(backend_caps)
+
+
+def _resolve_planner_backend(oracle_backend: Optional[str] = None) -> Optional[str]:
+    """Resolve which backend to use as the PLAN mode orchestrator.
+
+    Priority:
+      1. oracle_backend from request (x-consensus-oracle header reused for PLAN)
+      2. PLANNER_BACKEND config value
+      3. First configured cloud backend (last resort)
+    """
+    if oracle_backend:
+        return oracle_backend
+    planner = getattr(config, "PLANNER_BACKEND", "") or ""
+    if planner:
+        # Normalise: "claude" → "cloud:claude", "cloud:claude" → "cloud:claude"
+        if not planner.startswith("cloud:") and planner in (getattr(config, "CLOUD_BACKENDS", {}) or {}):
+            return f"cloud:{planner}"
+        return planner
+    # Fall back to first cloud backend
+    cloud_backends = getattr(config, "CLOUD_BACKENDS", {}) or {}
+    if cloud_backends:
+        return f"cloud:{next(iter(cloud_backends))}"
+    return None
+
+
+def _filter_nodes_by_capability(nodes: List[str], required: Optional[frozenset]) -> List[str]:
+    """Filter node list to only those matching required capabilities.
+
+    Falls back to the full list if no nodes match (capability tags are advisory).
+    """
+    if not required:
+        return nodes
+    filtered = [n for n in nodes if _backend_has_capabilities(n, required)]
+    if not filtered:
+        logger.warning(
+            "No backends match required capabilities %s — using all eligible nodes",
+            sorted(required),
+        )
+        return nodes
+    return filtered
 
 
 def _get_cloud_backend_name(node: str) -> Optional[str]:
@@ -1415,25 +1486,28 @@ def _get_model_class(model_name: str) -> Optional[str]:
 def _pick_cloud_model_for_class(model_class: Optional[str], cloud_backend_name: str) -> Optional[str]:
     """Pick a cloud model id for a given model class and cloud backend.
 
-    Preference order:
-    1) First candidate in MODEL_CLASSES[model_class].candidates that is listed for this cloud backend.
-    2) Otherwise, first configured CLOUD_MODELS entry for the backend.
+    Returns the first candidate in MODEL_CLASSES[model_class].candidates that is listed
+    for this cloud backend. Returns None if no model_class is provided or no matching
+    candidate exists.
 
-    Returns None if no candidate exists.
+    Note: We intentionally do NOT fall back to allowed[0] as that would cause
+    every model to be considered supported by every cloud backend.
     """
+    if not model_class:
+        return None
+
     cloud_models = getattr(config, "CLOUD_MODELS", {}) or {}
     allowed = cloud_models.get(cloud_backend_name, []) or []
     if not allowed:
         return None
 
-    if model_class:
-        classes_cfg = getattr(config, "MODEL_CLASSES", {}) or {}
-        candidates = ((classes_cfg.get(model_class) or {}).get("candidates", []) or [])
-        for m in candidates:
-            if m in allowed:
-                return m
+    classes_cfg = getattr(config, "MODEL_CLASSES", {}) or {}
+    candidates = ((classes_cfg.get(model_class) or {}).get("candidates", []) or [])
+    for m in candidates:
+        if m in allowed:
+            return m
 
-    return allowed[0]
+    return None
 
 
 async def _handle_multi_backend_execution(
@@ -1460,7 +1534,9 @@ async def _handle_multi_backend_execution(
     headers = {
         key: value
         for key, value in request.headers.items()
-        if key.lower() not in ('host', 'content-length', 'x-execution-mode', 'x-target-backends', 'x-max-backends', 'x-consensus-oracle', 'x-fallback-chain')
+        if key.lower() not in ('host', 'content-length', 'x-execution-mode', 'x-target-backends',
+                               'x-max-backends', 'x-consensus-oracle', 'x-fallback-chain',
+                               'x-require-capability')
     }
     headers["x-request-id"] = request_id
 
@@ -1471,6 +1547,9 @@ async def _handle_multi_backend_execution(
         all_eligible = list(set(eligible_nodes) | set(expanded_eligible))
     else:
         all_eligible = eligible_nodes
+
+    # Apply capability filtering if requested (Perplexity Computer-style specialization)
+    all_eligible = _filter_nodes_by_capability(all_eligible, ext_config.required_capabilities)
 
     # Select backends - use consensus-specific selection for consensus mode
     oracle_present = False
@@ -1561,6 +1640,61 @@ async def _handle_multi_backend_execution(
             ]
         }
         out = JSONResponse(content=resp_body)
+
+    elif exec_config.mode == ExecutionMode.PLAN:
+        # Perplexity Computer-style multi-step task decomposition + specialization
+        planner_node = _resolve_planner_backend(oracle_backend)
+        if not planner_node:
+            raise HTTPException(
+                status_code=503,
+                detail="PLAN mode requires PLANNER_BACKEND to be configured (or x-consensus-oracle set)"
+            )
+
+        # Build capability → eligible nodes mapping from all eligible nodes
+        caps_map = getattr(config, "BACKEND_CAPABILITIES", {}) or {}
+        capability_nodes: Dict[str, List[str]] = {}
+        for node in all_eligible:
+            key = node.replace("cloud:", "") if node.startswith("cloud:") else node
+            for cap in caps_map.get(key, []):
+                capability_nodes.setdefault(cap, []).append(node)
+
+        # call_backend: make an HTTP call to a specific backend with specific messages
+        async def call_backend_for_plan(backend_node: str, plan_messages: List[Dict]) -> BackendResult:
+            plan_body = dict(body)
+            plan_body["messages"] = plan_messages
+            plan_body.pop("stream", None)  # planner calls are non-streaming
+            return await _make_backend_request(
+                backend_node, plan_body, headers, model_name, request_id, start_time,
+            )
+
+        plan_result = await engine.execute_plan(
+            messages=body.get("messages", []),
+            call_backend=call_backend_for_plan,
+            planner_backend=planner_node,
+            capability_nodes=capability_nodes,
+            default_nodes=all_eligible,
+            max_subtasks=int(getattr(config, "PLAN_MAX_SUBTASKS", 5)),
+            subtask_timeout=float(getattr(config, "PLAN_SUBTASK_TIMEOUT_SECS", 30.0)),
+            overall_timeout=exec_config.timeout_secs,
+        )
+        await _record_multi_exec_metrics("plan", len(plan_result.task_results), 1 if plan_result.final_response and plan_result.final_response.success else 0)
+
+        if plan_result.error and not plan_result.final_response:
+            raise HTTPException(status_code=502, detail=f"PLAN execution failed: {plan_result.error}")
+
+        # Use final assembled response as the output
+        final = plan_result.final_response
+        resp_body = (final.response_body or {}) if final and final.success else {
+            "error": plan_result.error or "Plan assembly failed",
+            "goal": plan_result.goal,
+            "tasks_completed": len([r for r in plan_result.task_results.values() if r.success]),
+        }
+        out = JSONResponse(content=resp_body)
+        # Expose plan metadata in response headers
+        out.headers["x-plan-goal"] = (plan_result.goal or "")[:200]
+        out.headers["x-plan-tasks"] = str(len(plan_result.tasks))
+        out.headers["x-plan-planner"] = planner_node
+        backends = list(plan_result.task_results.keys())  # reuse for common header below
 
     elif exec_config.mode == ExecutionMode.CONSENSUS:
         # Execute consensus with oracle and local/cloud tracking
@@ -1884,7 +2018,30 @@ async def chat_completions(request: Request):
     # Resolve auto/default sentinel to a concrete model id
     if _is_model_sentinel(model_name):
         prefer_intersection = request.query_params.get("require_all", "false").lower() in ("1", "true", "yes")
-        resolved = await _resolve_auto_model(prefer_intersection=prefer_intersection)
+        resolved = None
+
+        # Complexity-based tier selection (RouteLLM-inspired, Apache-2.0 — lm-sys/RouteLLM)
+        if getattr(config, "COMPLEXITY_ROUTING_ENABLED", False):
+            messages = body.get("messages", [])
+            if messages:
+                _complexity_router = ComplexityRoutingStrategy()
+                score = _complexity_router.score_prompt_complexity(messages)
+                model_classes = getattr(config, "MODEL_CLASSES", {}) or {}
+                tier_candidates = _complexity_router.get_complexity_model(score, model_classes)
+                if tier_candidates:
+                    # Try each candidate in tier order until we find a healthy one
+                    for candidate in tier_candidates:
+                        candidate_nodes = await get_eligible_nodes(candidate)
+                        if candidate_nodes:
+                            resolved = candidate
+                            logger.info(
+                                "Complexity routing: score=%.2f selected tier candidate '%s'",
+                                score, candidate,
+                            )
+                            break
+
+        if not resolved:
+            resolved = await _resolve_auto_model(prefer_intersection=prefer_intersection)
         if not resolved:
             raise HTTPException(status_code=404, detail="No models available for auto selection.")
         body["model"] = resolved
@@ -1976,12 +2133,20 @@ async def chat_completions(request: Request):
     session_id = request.headers.get("x-session-id")
 
     async def attempt_stream(node: str):
-        # Determine URL and headers based on backend type (cloud vs local)
+        # Determine URL, headers, and request body based on backend type (cloud vs local)
+        adapter = None
+        req_body = body
         if _is_cloud_backend(node):
             url = _get_cloud_url(node, "/chat/completions")
             if not url:
                 raise httpx.RequestError(f"Cloud backend URL not configured for {node}")
             req_headers = _get_cloud_headers(node, headers)
+            # Get provider adapter for request/response transformation
+            cfg = _get_cloud_config(node)
+            if cfg:
+                provider_type = cfg.get("provider_type", "openai")
+                adapter = get_adapter(provider_type)
+                req_body = adapter.transform_request(body)
         else:
             url = f"http://{node}/v1/chat/completions"
             req_headers = headers
@@ -1996,7 +2161,7 @@ async def chat_completions(request: Request):
             await _dec_inflight(node)
             raise CapacityError("model")
         try:
-            async with http_client.stream("POST", url, json=body, headers=req_headers) as response:
+            async with http_client.stream("POST", url, json=req_body, headers=req_headers) as response:
                 # Handle rate limiting (429)
                 if response.status_code == 429:
                     retry_after = response.headers.get("retry-after")
@@ -2012,8 +2177,44 @@ async def chat_completions(request: Request):
                 if response.status_code and (response.status_code >= 500 or response.status_code == 404):
                     await _record_failure(node)
                     raise httpx.HTTPStatusError("Upstream retryable error", request=response.request, response=response)
-                async for chunk in response.aiter_bytes():
-                    yield chunk
+
+                # Stream with optional SSE transformation for cloud backends
+                if adapter:
+                    # Transform SSE stream using provider adapter
+                    buffer = ""
+                    current_event_type = None
+                    async for chunk in response.aiter_bytes():
+                        buffer += chunk.decode("utf-8", errors="replace")
+                        while "\n" in buffer:
+                            line, buffer = buffer.split("\n", 1)
+                            line = line.rstrip("\r")
+                            if not line:
+                                # Empty line - SSE event boundary
+                                continue
+                            # Parse the line
+                            parsed = adapter.parse_sse_line(line)
+                            if parsed is None:
+                                continue
+                            # Check for event type marker (Anthropic format)
+                            if "_event_type" in parsed:
+                                current_event_type = parsed["_event_type"]
+                                continue
+                            # Check for done signal
+                            if parsed.get("done"):
+                                yield b"data: [DONE]\n\n"
+                                continue
+                            # Merge event type into chunk if present
+                            if current_event_type and "type" not in parsed:
+                                parsed["type"] = current_event_type
+                            current_event_type = None
+                            # Transform to OpenAI format
+                            transformed = adapter.transform_stream_chunk(parsed)
+                            if transformed:
+                                yield f"data: {json.dumps(transformed)}\n\n".encode()
+                else:
+                    # Passthrough for local/OpenAI-compatible backends
+                    async for chunk in response.aiter_bytes():
+                        yield chunk
             await _record_success(node)
             await _clear_rate_limit(node)
         finally:
@@ -2373,12 +2574,20 @@ async def chat_completions(request: Request):
 
     # Non-streaming behavior: aggregate JSON and return a Response
     async def attempt_request(node: str):
-        # Determine URL and headers based on backend type (cloud vs local)
+        # Determine URL, headers, and request body based on backend type (cloud vs local)
+        adapter = None
+        req_body = body
         if _is_cloud_backend(node):
             url = _get_cloud_url(node, "/chat/completions")
             if not url:
                 raise httpx.RequestError(f"Cloud backend URL not configured for {node}")
             req_headers = _get_cloud_headers(node, headers)
+            # Get provider adapter for request/response transformation
+            cfg = _get_cloud_config(node)
+            if cfg:
+                provider_type = cfg.get("provider_type", "openai")
+                adapter = get_adapter(provider_type)
+                req_body = adapter.transform_request(body)
         else:
             url = f"http://{node}/v1/chat/completions"
             req_headers = headers
@@ -2394,13 +2603,13 @@ async def chat_completions(request: Request):
             raise CapacityError("model")
         try:
             try:
-                resp = await http_client.post(url, json=body, headers=req_headers)
+                resp = await http_client.post(url, json=req_body, headers=req_headers)
                 status_code = resp.status_code
                 content = resp.content
                 ctype = resp.headers.get("content-type", "application/json")
             except AttributeError:
                 # Compatibility for test fakes that implement only `.stream(...)`
-                async with http_client.stream("POST", url, json=body, headers=req_headers) as response:
+                async with http_client.stream("POST", url, json=req_body, headers=req_headers) as response:
                     status_code = getattr(response, "status_code", 200)
                     # Handle rate limiting (429)
                     if status_code == 429:
@@ -2429,6 +2638,14 @@ async def chat_completions(request: Request):
                 raise httpx.HTTPStatusError("Upstream retryable error", request=None, response=None)
             await _record_success(node)
             await _clear_rate_limit(node)
+            # Transform response for cloud backends
+            if adapter and status_code == 200:
+                try:
+                    response_body = json.loads(content)
+                    response_body = adapter.transform_response(response_body)
+                    content = json.dumps(response_body).encode()
+                except (json.JSONDecodeError, Exception) as e:
+                    logger.warning("[req=%s] Failed to transform cloud response: %s", request_id, e)
             out = Response(content=content, media_type=ctype, status_code=status_code)
             out.headers["x-selected-model"] = model_name
             out.headers["x-routed-node"] = node
@@ -3063,14 +3280,14 @@ async def metrics():
     lines.append("# TYPE ai_lb_multi_exec_total counter")
     multi_total = await redis_client.get("lb:multi_exec_total")
     lines.append(f"ai_lb_multi_exec_total {int(multi_total) if multi_total else 0}")
-    for mode in ("race", "all", "sequence", "consensus"):
+    for mode in ("race", "all", "sequence", "consensus", "plan"):
         val = await redis_client.get(f"lb:multi_exec_total:{mode}")
         if val:
             lines.append(f'ai_lb_multi_exec_total{{mode="{mode}"}} {int(val)}')
 
     lines.append("# HELP ai_lb_multi_exec_backends Backends attempted per multi-exec request by mode")
     lines.append("# TYPE ai_lb_multi_exec_backends summary")
-    for mode in ("race", "all", "sequence", "consensus"):
+    for mode in ("race", "all", "sequence", "consensus", "plan"):
         s_sum = await redis_client.get(f"lb:multi_exec_backends_sum:{mode}")
         s_cnt = await redis_client.get(f"lb:multi_exec_backends_count:{mode}")
         if s_cnt and int(s_cnt) > 0:
@@ -3079,7 +3296,7 @@ async def metrics():
 
     lines.append("# HELP ai_lb_multi_exec_succeeded Backends that succeeded per multi-exec request by mode")
     lines.append("# TYPE ai_lb_multi_exec_succeeded counter")
-    for mode in ("race", "all", "sequence", "consensus"):
+    for mode in ("race", "all", "sequence", "consensus", "plan"):
         val = await redis_client.get(f"lb:multi_exec_succeeded_sum:{mode}")
         if val:
             lines.append(f'ai_lb_multi_exec_succeeded{{mode="{mode}"}} {int(val)}')
