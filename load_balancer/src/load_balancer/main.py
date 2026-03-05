@@ -31,10 +31,12 @@ from .execution.modes import (
     PlanEvent,
 )
 from .providers import get_adapter
+from .config_validation import validate_config
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global redis_client, http_client, router
+    validate_config()
     logger.info("Load balancer starting up...")
     if redis_client is None:
         # Create Redis client with reasonable timeouts

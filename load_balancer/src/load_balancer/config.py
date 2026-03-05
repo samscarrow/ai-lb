@@ -1,4 +1,23 @@
 import os
+import pathlib
+
+
+def _read_secret(env_var: str, secret_file: str, default: str = "") -> str:
+    """Read a secret from a Docker-mounted file, falling back to env var (dev only)."""
+    p = pathlib.Path(secret_file)
+    if p.exists():
+        return p.read_text().strip()
+    return os.getenv(env_var, default)
+
+
+ANTHROPIC_API_KEY = _read_secret(
+    "ANTHROPIC_API_KEY",
+    "/run/secrets/anthropic_api_key",
+)
+OPENAI_API_KEY = _read_secret(
+    "OPENAI_API_KEY",
+    "/run/secrets/openai_api_key",
+)
 
 REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
 REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
