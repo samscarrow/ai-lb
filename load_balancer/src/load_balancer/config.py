@@ -138,3 +138,9 @@ ON_DEMAND_WARM_TIMEOUT_SECS = int(os.getenv("ON_DEMAND_WARM_TIMEOUT_SECS", 30))
 ON_DEMAND_WARM_GRACE_SECS = int(os.getenv("ON_DEMAND_WARM_GRACE_SECS", 30))
 ON_DEMAND_WARM_POLL_MS = int(os.getenv("ON_DEMAND_WARM_POLL_MS", 750))
 ON_DEMAND_WARM_FANOUT = int(os.getenv("ON_DEMAND_WARM_FANOUT", 2))  # probe up to N healthy nodes concurrently
+
+# Complexity routing thresholds
+# Derived from measured score distributions — see scorer signal weights in ComplexityRoutingStrategy.
+# Scores below LOW are routed to small models; scores in [LOW, HIGH) go to medium; HIGH+ to large.
+COMPLEXITY_THRESHOLD_LOW = float(os.getenv("COMPLEXITY_THRESHOLD_LOW", 0.10))
+COMPLEXITY_THRESHOLD_HIGH = float(os.getenv("COMPLEXITY_THRESHOLD_HIGH", 0.25))

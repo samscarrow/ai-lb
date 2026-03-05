@@ -226,6 +226,185 @@ class PowerOfTwoChoicesStrategy(RoutingStrategy):
             return 0.0
 
 
+class ComplexityRoutingStrategy(RoutingStrategy):
+    """Routes requests to different model tiers based on prompt complexity score.
+
+    The scorer combines four signals into a [0, 1] score using fixed weights and per-signal caps:
+
+    | Signal                  | Weight | Cap  |
+    |-------------------------|--------|------|
+    | Token length            |  0.30  | 0.30 |
+    | Structural complexity   |  0.20  | 0.20 |
+    | Question depth          |  0.25  | 0.25 |
+    | Vocabulary richness     |  0.25  | 0.25 |
+
+    The effective ceiling observed in practice is ~0.32. The tier boundaries are:
+
+    * score  < LOW  (0.10) → small tier  (simple, short prompts)
+    * LOW   <= score < HIGH (0.25) → medium tier (step-by-step / comparison questions)
+    * score >= HIGH (0.25) → large  tier (multi-signal, architectural reasoning)
+
+    ``model_tiers`` maps tier names to lists of candidate model IDs.  The strategy
+    picks the first tier for which at least one candidate node is available in the
+    supplied *nodes* list, falling back to any available node when none match.
+    """
+
+    # Tier boundary thresholds (calibrated against the scorer's actual output range)
+    LOW: float = 0.10
+    HIGH: float = 0.25
+
+    # Scorer signal weights and per-signal hard caps
+    _SIGNAL_LENGTH_WEIGHT: float = 0.30
+    _SIGNAL_STRUCTURE_WEIGHT: float = 0.20
+    _SIGNAL_DEPTH_WEIGHT: float = 0.25
+    _SIGNAL_VOCAB_WEIGHT: float = 0.25
+
+    # Length thresholds (in characters) for the token-length signal
+    _LENGTH_MID: int = 300
+    _LENGTH_HIGH: int = 1200
+
+    # Structural markers
+    _STRUCTURE_MARKERS: tuple = ("```", "    ", "\t", "- ", "* ", "1. ", "| ")
+
+    # Depth indicators
+    _DEPTH_INDICATORS: tuple = (
+        "step by step", "step-by-step", "compare", "versus", "vs.",
+        "explain why", "pros and cons", "tradeoff", "trade-off",
+        "what if", "how does", "analyze", "analyse",
+    )
+    # Number of depth indicator hits that saturates the depth signal (score → 1.0)
+    _DEPTH_SATURATION_THRESHOLD: float = 2.0
+
+    # Vocabulary richness proxy (technical / domain terms)
+    _VOCAB_TERMS: tuple = (
+        "architecture", "algorithm", "distributed", "concurrency", "latency",
+        "throughput", "cache", "database", "kubernetes", "microservice",
+        "api", "oauth", "jwt", "encryption", "inference", "fine-tun",
+        "gradient", "transformer", "embedding", "vector", "retrieval",
+    )
+    # Number of vocabulary term hits that saturates the vocab signal (score → 1.0)
+    _VOCAB_SATURATION_THRESHOLD: float = 3.0
+
+    def __init__(
+        self,
+        low: Optional[float] = None,
+        high: Optional[float] = None,
+        model_tiers: Optional[Dict[str, List[str]]] = None,
+        fallback_strategy: Optional[RoutingStrategy] = None,
+    ) -> None:
+        # Allow threshold override via constructor args (or config env vars)
+        self._low = low if low is not None else float(
+            getattr(_config, "COMPLEXITY_THRESHOLD_LOW", self.LOW)
+        )
+        self._high = high if high is not None else float(
+            getattr(_config, "COMPLEXITY_THRESHOLD_HIGH", self.HIGH)
+        )
+        # model_tiers maps "small" / "medium" / "large" → list[model_id]
+        # When not provided the strategy still classifies prompts but delegates
+        # all node selection to the fallback strategy.
+        self._model_tiers: Dict[str, List[str]] = model_tiers or {}
+        self._fallback: RoutingStrategy = fallback_strategy or RandomStrategy()
+
+    # ------------------------------------------------------------------
+    # Complexity scorer
+    # ------------------------------------------------------------------
+
+    def score_prompt(self, prompt: str) -> float:
+        """Return a complexity score in [0, 1] for *prompt*.
+
+        Four independent signals are computed, each capped at its weight, then
+        summed.  The effective ceiling is ~0.32 for typical natural language input.
+        """
+        text = prompt.lower()
+
+        # Signal 1 — token length (character proxy)
+        length = len(prompt)
+        if length >= self._LENGTH_HIGH:
+            length_score = 1.0
+        elif length >= self._LENGTH_MID:
+            length_score = (length - self._LENGTH_MID) / (self._LENGTH_HIGH - self._LENGTH_MID) * 0.5 + 0.5
+        else:
+            length_score = length / self._LENGTH_MID * 0.5
+        s1 = min(length_score * self._SIGNAL_LENGTH_WEIGHT, self._SIGNAL_LENGTH_WEIGHT)
+
+        # Signal 2 — structural complexity (code blocks, lists, tables)
+        structure_hits = sum(1 for m in self._STRUCTURE_MARKERS if m in prompt)
+        structure_score = min(structure_hits / max(len(self._STRUCTURE_MARKERS), 1), 1.0)
+        s2 = min(structure_score * self._SIGNAL_STRUCTURE_WEIGHT, self._SIGNAL_STRUCTURE_WEIGHT)
+
+        # Signal 3 — question depth (step-by-step, compare, analyse…)
+        depth_hits = sum(1 for d in self._DEPTH_INDICATORS if d in text)
+        depth_score = min(depth_hits / self._DEPTH_SATURATION_THRESHOLD, 1.0)
+        s3 = min(depth_score * self._SIGNAL_DEPTH_WEIGHT, self._SIGNAL_DEPTH_WEIGHT)
+
+        # Signal 4 — vocabulary richness (technical / domain terms)
+        vocab_hits = sum(1 for v in self._VOCAB_TERMS if v in text)
+        vocab_score = min(vocab_hits / self._VOCAB_SATURATION_THRESHOLD, 1.0)
+        s4 = min(vocab_score * self._SIGNAL_VOCAB_WEIGHT, self._SIGNAL_VOCAB_WEIGHT)
+
+        return s1 + s2 + s3 + s4
+
+    def classify(self, score: float) -> str:
+        """Map a complexity *score* to a tier name: ``'small'``, ``'medium'``, or ``'large'``."""
+        if score < self._low:
+            return "small"
+        if score < self._high:
+            return "medium"
+        return "large"
+
+    # ------------------------------------------------------------------
+    # Node selection
+    # ------------------------------------------------------------------
+
+    async def select_node(
+        self,
+        nodes: List[str],
+        model_name: str,
+        redis_client,
+        prompt: Optional[str] = None,
+    ) -> Optional[str]:
+        """Select a node, optionally guided by *prompt* complexity.
+
+        When *prompt* is ``None`` (or empty), the method delegates directly to
+        the fallback strategy so that the code path is safe for embeddings and
+        other non-chat requests that carry no human-readable prompt.
+        """
+        if not nodes:
+            return None
+
+        if not prompt or not self._model_tiers:
+            return await self._fallback.select_node(nodes, model_name, redis_client)
+
+        score = self.score_prompt(prompt)
+        tier = self.classify(score)
+
+        # Walk tier preference: requested tier → adjacent tiers → any node
+        tier_order = self._tier_preference(tier)
+        for t in tier_order:
+            candidates = self._model_tiers.get(t, [])
+            tier_nodes = [n for n in nodes if any(c in n for c in candidates)]
+            if tier_nodes:
+                return await self._fallback.select_node(tier_nodes, model_name, redis_client)
+
+        # No tier matched — use all available nodes via fallback
+        return await self._fallback.select_node(nodes, model_name, redis_client)
+
+    @staticmethod
+    def _tier_preference(tier: str) -> List[str]:
+        """Return ordered tier names starting from *tier*, expanding outward."""
+        order = ["small", "medium", "large"]
+        if tier not in order:
+            return order
+        idx = order.index(tier)
+        result = [tier]
+        for offset in range(1, len(order)):
+            if idx - offset >= 0:
+                result.append(order[idx - offset])
+            if idx + offset < len(order):
+                result.append(order[idx + offset])
+        return result
+
+
 class ConsistentHashingStrategy(RoutingStrategy):
     """Consistent hashing for sticky sessions."""
     
@@ -285,6 +464,7 @@ STRATEGIES = {
     "P2C": PowerOfTwoChoicesStrategy,
     "POWER_OF_TWO": PowerOfTwoChoicesStrategy,
     "CONSISTENT_HASH": ConsistentHashingStrategy,
+    "COMPLEXITY": ComplexityRoutingStrategy,
 }
 
 def get_routing_strategy(strategy_name: str, **kwargs) -> RoutingStrategy:
@@ -301,5 +481,11 @@ def get_routing_strategy(strategy_name: str, **kwargs) -> RoutingStrategy:
         )
     elif strategy_name.upper() == "CONSISTENT_HASH":
         return strategy_class(virtual_nodes=kwargs.get("virtual_nodes", 150))
+    elif strategy_name.upper() == "COMPLEXITY":
+        return strategy_class(
+            low=kwargs.get("low", None),
+            high=kwargs.get("high", None),
+            model_tiers=kwargs.get("model_tiers", None),
+        )
     else:
         return strategy_class()
