@@ -3312,8 +3312,8 @@ async def responses_api(request: Request):
             "arguments": tc["function"]["arguments"],
         })
 
-    # Text content
-    content = msg.get("content")
+    # Text content (some models put text in "reasoning" instead of "content")
+    content = msg.get("content") or msg.get("reasoning") or ""
     if content:
         output.append({
             "type": "message",
