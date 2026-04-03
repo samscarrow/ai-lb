@@ -3245,6 +3245,98 @@ async def chat_completions(request: Request):
                 return resp
     raise HTTPException(status_code=502, detail={"message": "All upstream nodes failed for chat model.", "model": model_name, "attempts": attempts, "nodes": tried_order}, headers={"x-request-id": request_id, "x-attempts": str(attempts), "x-failover-count": str(max(0, attempts-1))})
 
+@app.api_route("/v1/responses", methods=["POST"])
+async def responses_api(request: Request):
+    """OpenAI Responses API -> Chat Completions translation layer.
+
+    Accepts the Responses API format, converts to chat completions,
+    forwards to our own /v1/chat/completions endpoint, and converts
+    the response back to Responses API format.
+    """
+    try:
+        raw = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Request body must be valid JSON.")
+
+    # --- Build chat completions payload ---
+    messages = []
+    if "instructions" in raw:
+        messages.append({"role": "system", "content": raw["instructions"]})
+
+    inp = raw.get("input", "")
+    if isinstance(inp, str):
+        messages.append({"role": "user", "content": inp})
+    elif isinstance(inp, list):
+        messages.extend(inp)
+
+    cc_body: Dict[str, Any] = {
+        "model": raw.get("model", "auto"),
+        "messages": messages,
+        "stream": False,  # Force non-streaming; convert later if needed
+    }
+    if "tools" in raw:
+        cc_body["tools"] = raw["tools"]
+    if "tool_choice" in raw:
+        cc_body["tool_choice"] = raw["tool_choice"]
+    if "max_output_tokens" in raw:
+        cc_body["max_tokens"] = raw["max_output_tokens"]
+    if "temperature" in raw:
+        cc_body["temperature"] = raw["temperature"]
+
+    # --- Forward to our own chat completions endpoint ---
+    server = request.scope.get("server")  # (host, port) tuple
+    port = server[1] if server else 8002
+    lb_url = f"http://127.0.0.1:{port}/v1/chat/completions"
+
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(lb_url, json=cc_body, timeout=120.0)
+
+    if resp.status_code != 200:
+        return JSONResponse(content=resp.json(), status_code=resp.status_code)
+
+    cc = resp.json()
+
+    # --- Convert to Responses API format ---
+    choice = cc.get("choices", [{}])[0]
+    msg = choice.get("message", {})
+
+    output = []
+
+    # Tool calls
+    for tc in msg.get("tool_calls", []):
+        output.append({
+            "type": "function_call",
+            "id": f"fc_{uuid.uuid4().hex[:24]}",
+            "call_id": tc.get("id", f"call_{uuid.uuid4().hex[:24]}"),
+            "name": tc["function"]["name"],
+            "arguments": tc["function"]["arguments"],
+        })
+
+    # Text content
+    content = msg.get("content")
+    if content:
+        output.append({
+            "type": "message",
+            "id": f"msg_{uuid.uuid4().hex[:24]}",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": content}],
+        })
+
+    usage = cc.get("usage", {})
+
+    return JSONResponse(content={
+        "id": f"resp_{uuid.uuid4().hex[:24]}",
+        "object": "response",
+        "created_at": cc.get("created", int(time.time())),
+        "model": cc.get("model", raw.get("model", "unknown")),
+        "output": output,
+        "usage": {
+            "input_tokens": usage.get("prompt_tokens", 0),
+            "output_tokens": usage.get("completion_tokens", 0),
+            "total_tokens": usage.get("total_tokens", 0),
+        },
+    })
+
 @app.api_route("/v1/embeddings", methods=["POST"])
 async def embeddings(request: Request):
     try:
