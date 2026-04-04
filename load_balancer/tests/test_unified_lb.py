@@ -60,6 +60,10 @@ class FakeRedis:
         self.kv[key] = v
         return v
 
+    async def ttl(self, key):
+        # No real TTL tracking in fake; return -1 (key exists, no expire)
+        return -1 if key in self.kv else -2
+
     async def close(self):
         return True
 
@@ -129,6 +133,56 @@ def test_health_endpoint_reports_minimum(monkeypatch):
         assert resp_bad.status_code == 503
 
 
+def test_health_models_param_includes_per_model_status(monkeypatch):
+    """?models=true adds per-model availability to /health response."""
+    from load_balancer import config as cfg
+    cfg.CB_SCOPE = "model"
+
+    r = lb_main.redis_client
+    r.sets["nodes:healthy"] = {"n1"}
+    run(r.set("node:n1:models", json.dumps({"data": [{"id": "ok"}, {"id": "bad"}]})))
+    run(r.set("node:n1:model:bad:cb_open", "1"))
+
+    with make_client() as c:
+        resp = c.get("/health", params={"models": "true"})
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["status"] == "healthy"
+        assert "models" in body
+        assert body["models"]["ok"]["status"] == "available"
+        assert body["models"]["bad"]["status"] == "unavailable"
+
+
+def test_health_degraded_when_model_aware(monkeypatch):
+    """With HEALTH_MODEL_AWARE=true, status becomes degraded if any model is unavailable."""
+    from load_balancer import config as cfg
+    cfg.CB_SCOPE = "model"
+    cfg.HEALTH_MODEL_AWARE = True
+
+    r = lb_main.redis_client
+    r.sets["nodes:healthy"] = {"n1"}
+    run(r.set("node:n1:models", json.dumps({"data": [{"id": "ok"}, {"id": "bad"}]})))
+    run(r.set("node:n1:model:bad:cb_open", "1"))
+
+    with make_client() as c:
+        resp = c.get("/health", params={"models": "true"})
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "degraded"
+
+
+def test_health_backwards_compat_without_models_param(monkeypatch):
+    """Without ?models, response shape is unchanged."""
+    r = lb_main.redis_client
+    r.sets["nodes:healthy"] = {"n1"}
+    run(r.set("node:n1:models", json.dumps({"data": [{"id": "m"}]})))
+
+    with make_client() as c:
+        resp = c.get("/health")
+        body = resp.json()
+        assert "models" not in body
+        assert set(body.keys()) == {"status", "nodes_found", "minimum_required"}
+
+
 def test_models_aggregate_unique(monkeypatch):
     r = lb_main.redis_client
     r.sets["nodes:healthy"] = {"n1", "n2"}
@@ -140,6 +194,47 @@ def test_models_aggregate_unique(monkeypatch):
         assert resp.status_code == 200
         ids = {m["id"] for m in resp.json()["data"]}
         assert ids == {"m1", "m2"}
+
+
+def test_models_filters_unavailable_by_default(monkeypatch):
+    """Models with all nodes CB'd should be hidden from /v1/models by default."""
+    from load_balancer import config as cfg
+    cfg.CB_SCOPE = "model"
+
+    r = lb_main.redis_client
+    r.sets["nodes:healthy"] = {"n1"}
+    run(r.set("node:n1:models", json.dumps({"data": [{"id": "healthy_model"}, {"id": "broken_model"}]})))
+    # CB broken_model on n1
+    run(r.set("node:n1:model:broken_model:cb_open", "1"))
+
+    with make_client() as c:
+        resp = c.get("/v1/models")
+        assert resp.status_code == 200
+        ids = {m["id"] for m in resp.json()["data"]}
+        assert "healthy_model" in ids
+        assert "broken_model" not in ids
+
+
+def test_models_detail_shows_all_with_status(monkeypatch):
+    """/v1/models?detail=true shows all models including unavailable, with x_llb_* fields."""
+    from load_balancer import config as cfg
+    cfg.CB_SCOPE = "model"
+
+    r = lb_main.redis_client
+    r.sets["nodes:healthy"] = {"n1"}
+    run(r.set("node:n1:models", json.dumps({"data": [{"id": "ok"}, {"id": "bad"}]})))
+    run(r.set("node:n1:model:bad:cb_open", "1"))
+
+    with make_client() as c:
+        resp = c.get("/v1/models", params={"detail": "true"})
+        assert resp.status_code == 200
+        models = {m["id"]: m for m in resp.json()["data"]}
+        assert "ok" in models
+        assert "bad" in models
+        assert models["ok"]["x_llb_status"] == "available"
+        assert models["ok"]["x_llb_eligible_nodes"] == 1
+        assert models["bad"]["x_llb_status"] == "unavailable"
+        assert models["bad"]["x_llb_eligible_nodes"] == 0
 
 
 def test_routing_round_robin_and_failover(monkeypatch):
@@ -269,6 +364,188 @@ def test_circuit_breaker_skips_failed_node(monkeypatch):
         )
         text2 = b"".join(resp2.iter_bytes())
         assert b"ok" in text2
+
+
+def test_circuit_breaker_model_scoped_isolates_models(monkeypatch):
+    """Model A failures on a node should not CB model B on the same node."""
+    from load_balancer import config as cfg
+    cfg.CIRCUIT_BREAKER_THRESHOLD = 1
+    cfg.CB_SCOPE = "model"
+
+    r = lb_main.redis_client
+    r.sets["nodes:healthy"] = {"shared_node"}
+    run(r.set("node:shared_node:models", json.dumps({"data": [{"id": "modelA"}, {"id": "modelB"}]})))
+
+    # Trip model-scoped CB for modelA only
+    run(r.set("node:shared_node:model:modelA:cb_open", "1"))
+
+    # modelA should have no eligible nodes
+    eligible_a = run(lb_main.get_eligible_nodes("modelA"))
+    assert eligible_a == [], f"Expected no eligible nodes for modelA, got {eligible_a}"
+
+    # modelB should still be eligible on the same node
+    eligible_b = run(lb_main.get_eligible_nodes("modelB"))
+    assert "shared_node" in eligible_b
+
+
+def test_circuit_breaker_node_wide_still_blocks_all(monkeypatch):
+    """Node-wide CB still blocks all models as a fallback."""
+    from load_balancer import config as cfg
+    cfg.CIRCUIT_BREAKER_THRESHOLD = 1
+    cfg.CB_SCOPE = "model"
+
+    r = lb_main.redis_client
+    r.sets["nodes:healthy"] = {"node1"}
+    run(r.set("node:node1:models", json.dumps({"data": [{"id": "m1"}, {"id": "m2"}]})))
+
+    # Trip node-wide CB (not model-scoped)
+    run(r.set("node:node1:cb_open", "1"))
+
+    # Both models should be blocked
+    assert run(lb_main.get_eligible_nodes("m1")) == []
+    assert run(lb_main.get_eligible_nodes("m2")) == []
+
+
+def test_circuit_breaker_legacy_scope_ignores_model_keys(monkeypatch):
+    """When CB_SCOPE=node, model-scoped keys are ignored."""
+    from load_balancer import config as cfg
+    cfg.CIRCUIT_BREAKER_THRESHOLD = 1
+    cfg.CB_SCOPE = "node"
+
+    r = lb_main.redis_client
+    r.sets["nodes:healthy"] = {"n1"}
+    run(r.set("node:n1:models", json.dumps({"data": [{"id": "m"}]})))
+
+    # Set model-scoped CB (should be ignored with CB_SCOPE=node)
+    run(r.set("node:n1:model:m:cb_open", "1"))
+
+    # Node should still be eligible since node-wide CB is not open
+    eligible = run(lb_main.get_eligible_nodes("m"))
+    assert "n1" in eligible
+
+
+def test_debug_eligible_shows_model_cb(monkeypatch):
+    """Debug endpoint should expose both node-wide and model-scoped CB state."""
+    from load_balancer import config as cfg
+    cfg.CB_SCOPE = "model"
+
+    r = lb_main.redis_client
+    r.sets["nodes:healthy"] = {"n1"}
+    run(r.set("node:n1:models", json.dumps({"data": [{"id": "m"}]})))
+    run(r.set("node:n1:model:m:cb_open", "1"))
+
+    with make_client() as c:
+        resp = c.get("/v1/debug/eligible", params={"model": "m"})
+        data = resp.json()
+        detail = data["details"][0]
+        assert detail["cb_model_open"] is True
+        assert detail["cb_open"] is False
+        assert detail["skipped"] is True
+        assert detail["reason"] == "circuit_open"
+        assert data["eligible"] == []
+
+
+def test_fail_fast_on_cb_open_model_chat(monkeypatch):
+    """Chat completions should return 503 immediately when all nodes for a model have CB open."""
+    from load_balancer import config as cfg
+    cfg.CB_SCOPE = "model"
+
+    r = lb_main.redis_client
+    r.sets["nodes:healthy"] = {"n1"}
+    run(r.set("node:n1:models", json.dumps({"data": [{"id": "broken"}]})))
+    run(r.set("node:n1:model:broken:cb_open", "1"))
+
+    with make_client() as c:
+        resp = c.post(
+            "/v1/chat/completions",
+            json={"model": "broken", "messages": [{"role": "user", "content": "hi"}]},
+        )
+        assert resp.status_code == 503
+        body = resp.json()
+        assert body["error"]["code"] == "model_unavailable"
+        assert body["error"]["x_llb_diagnosis"]["reason"] == "circuit_open"
+        assert "Retry-After" in resp.headers
+
+
+def test_fail_fast_on_cb_open_model_embeddings(monkeypatch):
+    """Embeddings should return 503 immediately when all nodes for a model have CB open."""
+    from load_balancer import config as cfg
+    cfg.CB_SCOPE = "model"
+
+    r = lb_main.redis_client
+    r.sets["nodes:healthy"] = {"n1"}
+    run(r.set("node:n1:models", json.dumps({"data": [{"id": "embed-model"}]})))
+    run(r.set("node:n1:model:embed-model:cb_open", "1"))
+
+    with make_client() as c:
+        resp = c.post(
+            "/v1/embeddings",
+            json={"model": "embed-model", "input": "hello"},
+        )
+        assert resp.status_code == 503
+        body = resp.json()
+        assert body["error"]["x_llb_diagnosis"]["reason"] == "circuit_open"
+
+
+def test_unknown_model_still_returns_404(monkeypatch):
+    """A model that no node has should still get 404 (not 503), skipping warm if disabled."""
+    from load_balancer import config as cfg
+    cfg.ON_DEMAND_WAIT_ENABLED = False
+    cfg.CROSS_MODEL_FALLBACK = False
+
+    r = lb_main.redis_client
+    r.sets["nodes:healthy"] = {"n1"}
+    run(r.set("node:n1:models", json.dumps({"data": [{"id": "other"}]})))
+
+    with make_client() as c:
+        resp = c.post(
+            "/v1/chat/completions",
+            json={"model": "nonexistent", "messages": [{"role": "user", "content": "hi"}]},
+        )
+        assert resp.status_code == 404
+
+
+def test_routing_headers_on_chat_stream(monkeypatch):
+    """Streaming chat completions responses include x-llb-* routing headers."""
+    r = lb_main.redis_client
+    r.sets["nodes:healthy"] = {"n1", "n2"}
+    run(r.set("node:n1:models", json.dumps({"data": [{"id": "m"}]})))
+    run(r.set("node:n2:models", json.dumps({"data": [{"id": "m"}]})))
+
+    lb_main.http_client = FakeHTTPClient({
+        "n1": {"chunks": [b"data: ok\n\n"]},
+        "n2": {"chunks": [b"data: ok\n\n"]},
+    })
+    with make_client() as c:
+        resp = c.post(
+            "/v1/chat/completions",
+            json={"model": "m", "messages": [{"role": "user", "content": "hi"}], "stream": True},
+        )
+        _ = b"".join(resp.iter_bytes())
+        assert "x-llb-eligible-nodes" in resp.headers
+        assert "x-llb-total-nodes" in resp.headers
+        assert "x-llb-routing-strategy" in resp.headers
+        assert int(resp.headers["x-llb-eligible-nodes"]) == 2
+        assert int(resp.headers["x-llb-total-nodes"]) == 2
+
+
+def test_routing_headers_on_fail_fast_503(monkeypatch):
+    """503 fail-fast responses include Retry-After and routing context."""
+    from load_balancer import config as cfg
+    cfg.CB_SCOPE = "model"
+
+    r = lb_main.redis_client
+    r.sets["nodes:healthy"] = {"n1"}
+    run(r.set("node:n1:models", json.dumps({"data": [{"id": "m"}]})))
+    run(r.set("node:n1:model:m:cb_open", "1"))
+
+    with make_client() as c:
+        resp = c.post(
+            "/v1/chat/completions",
+            json={"model": "m", "messages": [{"role": "user", "content": "hi"}]},
+        )
+        assert resp.status_code == 503
+        assert "Retry-After" in resp.headers
 
 
 def test_metrics_endpoint(monkeypatch):

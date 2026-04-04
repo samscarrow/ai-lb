@@ -217,8 +217,8 @@ async def get_eligible_nodes(model_name: str, include_cloud: bool = True):
     healthy_nodes = sorted(await redis_client.smembers("nodes:healthy"))
     eligible_nodes = []
     for node in healthy_nodes:
-        # Skip nodes on open circuit for this period
-        if await _is_circuit_open(node):
+        # Skip nodes on open circuit for this model (or node-wide)
+        if await _is_circuit_open(node, model_name):
             continue
         # Skip nodes that are currently rate-limited (429 backoff)
         if await _is_rate_limited(node):
@@ -295,6 +295,68 @@ async def _aggregate_models_by_node() -> dict:
                 ids = []
         out[node] = ids
     return out
+
+async def _model_availability(model_id: str) -> dict:
+    """Return availability diagnostics for a single model across healthy nodes.
+
+    Returns dict with keys: eligible_nodes, total_nodes, status, unavailable_reasons.
+    """
+    healthy_nodes = sorted(await redis_client.smembers("nodes:healthy"))
+    total_nodes = 0
+    eligible_nodes = 0
+    reasons: list[str] = []
+
+    for node in healthy_nodes:
+        models_json = await redis_client.get(f"node:{node}:models")
+        if not models_json:
+            continue
+        try:
+            models = json.loads(models_json).get("data", [])
+        except Exception:
+            continue
+        supports_key = f"node:{node}:supports:{model_id}"
+        supports = await redis_client.get(supports_key)
+        has_model = any(m.get("id") == model_id for m in models) or (supports is not None and supports != "0")
+        if not has_model:
+            continue
+        total_nodes += 1
+
+        # Check circuit breaker (model-scoped then node-wide)
+        if await _is_circuit_open(node, model_id):
+            reasons.append(f"circuit_open:{node}")
+            continue
+        # Check rate limit
+        if await _is_rate_limited(node):
+            reasons.append(f"rate_limited:{node}")
+            continue
+        eligible_nodes += 1
+
+    if total_nodes == 0:
+        status = "unavailable"
+    elif eligible_nodes == 0:
+        status = "unavailable"
+    elif eligible_nodes < total_nodes:
+        status = "degraded"
+    else:
+        status = "available"
+
+    return {
+        "eligible_nodes": eligible_nodes,
+        "total_nodes": total_nodes,
+        "status": status,
+        "unavailable_reasons": reasons,
+    }
+
+
+async def _routing_headers(model_name: str, eligible_count: int) -> dict:
+    """Build x-llb-* routing diagnostic headers."""
+    avail = await _model_availability(model_name)
+    return {
+        "x-llb-eligible-nodes": str(eligible_count),
+        "x-llb-total-nodes": str(avail["total_nodes"]),
+        "x-llb-routing-strategy": getattr(config, "ROUTING_STRATEGY", "P2C"),
+    }
+
 
 def _is_model_sentinel(name: Optional[str]) -> bool:
     if not name:
@@ -420,20 +482,31 @@ async def debug_eligible(model: str):
     healthy_nodes = sorted(await redis_client.smembers("nodes:healthy"))
     details = []
     for node in healthy_nodes:
-        item = {"node": node, "has_model": False, "cb_open": False, "p95": None, "skipped": False, "reason": ""}
+        item = {"node": node, "has_model": False, "cb_open": False, "cb_model_open": False, "p95": None, "skipped": False, "reason": ""}
         try:
             models_json = await redis_client.get(f"node:{node}:models")
             models = json.loads(models_json).get("data", []) if models_json else []
             has = any(m.get("id") == model for m in models)
             item["has_model"] = has
-            item["cb_open"] = await _is_circuit_open(node)
+            # Node-wide CB
+            try:
+                nv = await redis_client.get(f"node:{node}:cb_open")
+                item["cb_open"] = nv is not None and nv != "0"
+            except Exception:
+                pass
+            # Model-scoped CB
+            try:
+                mv = await redis_client.get(f"node:{node}:model:{model}:cb_open")
+                item["cb_model_open"] = mv is not None and mv != "0"
+            except Exception:
+                pass
             p95 = await _series_p95(model, node)
             item["p95"] = p95
             # Apply same logic as get_eligible_nodes
             if not has:
                 item["skipped"] = True
                 item["reason"] = "model_missing"
-            elif item["cb_open"]:
+            elif item["cb_open"] or item["cb_model_open"]:
                 item["skipped"] = True
                 item["reason"] = "circuit_open"
             else:
@@ -445,7 +518,7 @@ async def debug_eligible(model: str):
             item["skipped"] = True
             item["reason"] = f"error:{e}"
         details.append(item)
-    eligible = [d["node"] for d in details if not d["skipped"] and d["has_model"] and not d["cb_open"]]
+    eligible = [d["node"] for d in details if not d["skipped"] and d["has_model"] and not d["cb_open"] and not d["cb_model_open"]]
     return {"healthy": healthy_nodes, "eligible": eligible, "details": details}
 
 async def _inc_inflight(node: str):
@@ -554,28 +627,55 @@ async def _penalize_failure(node: str):
         pass
 
 async def _record_failure(node: str, model: str = ""):
+    cooldown = _cb_cooldown_secs()
     try:
+        # Always increment node-wide failures
         key = f"node:{node}:failures"
         failures = await redis_client.incrby(key, 1)
-        await redis_client.expire(key, _cb_cooldown_secs())
+        await redis_client.expire(key, cooldown)
         if failures >= config.CIRCUIT_BREAKER_THRESHOLD:
             await redis_client.set(f"node:{node}:cb_open", "1")
-            await redis_client.expire(f"node:{node}:cb_open", _cb_cooldown_secs())
+            await redis_client.expire(f"node:{node}:cb_open", cooldown)
     except Exception:
         pass
+    # Per-(node, model) circuit breaker
+    if model and getattr(config, "CB_SCOPE", "model") == "model":
+        try:
+            mkey = f"node:{node}:model:{model}:failures"
+            mfailures = await redis_client.incrby(mkey, 1)
+            await redis_client.expire(mkey, cooldown)
+            if mfailures >= config.CIRCUIT_BREAKER_THRESHOLD:
+                await redis_client.set(f"node:{node}:model:{model}:cb_open", "1")
+                await redis_client.expire(f"node:{node}:model:{model}:cb_open", cooldown)
+        except Exception:
+            pass
     # Inject penalty RTT into EWMA so P2C scoring naturally degrades this node
     if model:
         await _record_failure_penalty(model, node)
 
-async def _record_success(node: str):
+async def _record_success(node: str, model: str = ""):
     try:
         await redis_client.set(f"node:{node}:failures", 0)
         await redis_client.expire(f"node:{node}:failures", _cb_cooldown_secs())
-        # closing circuit simply by letting cb_open expire; do nothing here
     except Exception:
         pass
+    if model and getattr(config, "CB_SCOPE", "model") == "model":
+        try:
+            await redis_client.set(f"node:{node}:model:{model}:failures", 0)
+            await redis_client.expire(f"node:{node}:model:{model}:failures", _cb_cooldown_secs())
+        except Exception:
+            pass
 
-async def _is_circuit_open(node: str) -> bool:
+async def _is_circuit_open(node: str, model: str = "") -> bool:
+    # Check model-scoped breaker first (more specific)
+    if model and getattr(config, "CB_SCOPE", "model") == "model":
+        try:
+            val = await redis_client.get(f"node:{node}:model:{model}:cb_open")
+            if val is not None and val != "0":
+                return True
+        except Exception:
+            pass
+    # Fall back to node-wide breaker
     try:
         val = await redis_client.get(f"node:{node}:cb_open")
         return val is not None and val != "0"
@@ -699,6 +799,60 @@ async def _warm_model_on_nodes(model: str, nodes: list[str]) -> None:
             return
     # Launch concurrently
     await asyncio.gather(*[one(n) for n in nodes])
+
+async def _diagnose_unroutable(model_name: str) -> dict:
+    """Diagnose why a model has no eligible nodes. Returns structured diagnosis."""
+    healthy_nodes = sorted(await redis_client.smembers("nodes:healthy"))
+    if not healthy_nodes:
+        return {"reason": "no_healthy_nodes", "nodes_with_model": 0, "cb_open_nodes": [], "rate_limited_nodes": [], "retry_after_secs": 0}
+
+    nodes_with_model = []
+    cb_open = []
+    rate_limited = []
+    max_ttl = 0
+
+    for node in healthy_nodes:
+        models_json = await redis_client.get(f"node:{node}:models")
+        if not models_json:
+            continue
+        try:
+            models = json.loads(models_json).get("data", [])
+        except Exception:
+            continue
+        supports_key = f"node:{node}:supports:{model_name}"
+        supports = await redis_client.get(supports_key)
+        has_model = any(m.get("id") == model_name for m in models) or (supports is not None and supports != "0")
+        if not has_model:
+            continue
+        nodes_with_model.append(node)
+
+        if await _is_circuit_open(node, model_name):
+            cb_open.append(node)
+            # Estimate TTL remaining on CB key
+            try:
+                ttl = await redis_client.ttl(f"node:{node}:model:{model_name}:cb_open")
+                if ttl and ttl > 0:
+                    max_ttl = max(max_ttl, ttl)
+                else:
+                    ttl = await redis_client.ttl(f"node:{node}:cb_open")
+                    if ttl and ttl > 0:
+                        max_ttl = max(max_ttl, ttl)
+            except Exception:
+                pass
+        elif await _is_rate_limited(node):
+            rate_limited.append(node)
+
+    if not nodes_with_model:
+        return {"reason": "model_unknown", "nodes_with_model": 0, "cb_open_nodes": [], "rate_limited_nodes": [], "retry_after_secs": 0}
+
+    if cb_open and len(cb_open) == len(nodes_with_model):
+        return {"reason": "circuit_open", "nodes_with_model": len(nodes_with_model), "cb_open_nodes": cb_open, "rate_limited_nodes": [], "retry_after_secs": max_ttl or _cb_cooldown_secs()}
+
+    if rate_limited and len(rate_limited) + len(cb_open) == len(nodes_with_model):
+        return {"reason": "rate_limited", "nodes_with_model": len(nodes_with_model), "cb_open_nodes": cb_open, "rate_limited_nodes": rate_limited, "retry_after_secs": getattr(config, "RETRY_AFTER_SECS", 2)}
+
+    return {"reason": "unknown", "nodes_with_model": len(nodes_with_model), "cb_open_nodes": cb_open, "rate_limited_nodes": rate_limited, "retry_after_secs": 0}
+
 
 async def _on_demand_wait_for_model(model: str) -> list[str]:
     """If no nodes are eligible, probe a few healthy nodes to load the model and poll until any become eligible or grace window elapses."""
@@ -1388,10 +1542,10 @@ async def _make_backend_request(
                 await _record_rate_limit(backend, retry_after_secs)
                 result.error = f"HTTP 429 Rate Limited"
             elif resp.status_code >= 500 or resp.status_code == 404:
-                await _record_failure(backend)
+                await _record_failure(backend, model_name)
                 result.error = f"HTTP {resp.status_code}"
             else:
-                await _record_success(backend)
+                await _record_success(backend, model_name)
                 # Clear any previous rate limit state on success
                 await _clear_rate_limit(backend)
                 result.success = True
@@ -1421,13 +1575,13 @@ async def _make_backend_request(
                     await _record_rate_limit(backend, retry_after_secs)
                     result.error = f"HTTP 429 Rate Limited"
                 elif result.status_code >= 500 or result.status_code == 404:
-                    await _record_failure(backend)
+                    await _record_failure(backend, model_name)
                     result.error = f"HTTP {result.status_code}"
                 else:
                     chunks = bytearray()
                     async for chunk in response.aiter_bytes():
                         chunks.extend(chunk)
-                    await _record_success(backend)
+                    await _record_success(backend, model_name)
                     await _clear_rate_limit(backend)
                     result.success = True
                     try:
@@ -1440,10 +1594,10 @@ async def _make_backend_request(
                         result.response_body = {"raw": bytes(chunks).decode(errors="replace")}
 
     except httpx.RequestError as e:
-        await _record_failure(backend)
+        await _record_failure(backend, model_name)
         result.error = str(e)
     except Exception as e:
-        await _record_failure(backend)
+        await _record_failure(backend, model_name)
         result.error = str(e)
     finally:
         await _dec_inflight(backend)
@@ -2077,8 +2231,14 @@ async def _execute_with_fallback_chain(
 
 
 @app.get("/v1/models")
-async def get_all_models():
-    """Aggregates and de-duplicates model lists from all healthy nodes."""
+async def get_all_models(request: Request):
+    """Aggregates and de-duplicates model lists from all healthy nodes.
+
+    Query params:
+      detail=true  — include all models (even unavailable) with x_llb_* availability metadata.
+      (default)    — only return models that are currently routable.
+    """
+    detail = request.query_params.get("detail", "false").lower() in ("1", "true", "yes")
     healthy_nodes = await redis_client.smembers("nodes:healthy")
     all_models = {}
     for node in healthy_nodes:
@@ -2089,16 +2249,27 @@ async def get_all_models():
                 mid = model.get("id")
                 if mid and mid not in all_models:
                     all_models[mid] = model
-    # Ensure every model object has the OpenAI-required fields
+    # Ensure every model object has the OpenAI-required fields and check availability
     data = []
     for m in all_models.values():
-        data.append({
+        avail = await _model_availability(m["id"])
+        # Default: filter out models with no eligible nodes
+        if not detail and avail["status"] == "unavailable":
+            continue
+        entry = {
             "id": m["id"],
             "object": m.get("object", "model"),
             "created": m.get("created", 0),
             "owned_by": m.get("owned_by", "local"),
             **{k: v for k, v in m.items() if k not in ("id", "object", "created", "owned_by")},
-        })
+        }
+        if detail:
+            entry["x_llb_status"] = avail["status"]
+            entry["x_llb_eligible_nodes"] = avail["eligible_nodes"]
+            entry["x_llb_total_nodes"] = avail["total_nodes"]
+            if avail["unavailable_reasons"]:
+                entry["x_llb_unavailable_reasons"] = avail["unavailable_reasons"]
+        data.append(entry)
     return {"object": "list", "data": data}
 
 # Latency histogram buckets in seconds
@@ -2303,7 +2474,21 @@ async def chat_completions(request: Request):
     warm_wait_ms = 0
 
     if not eligible_nodes:
-        # On-demand warm/wait: try to load the model on a few healthy nodes, then poll briefly
+        # Diagnose why before deciding whether to warm or fail fast
+        diagnosis = await _diagnose_unroutable(model_name)
+        if diagnosis["reason"] in ("circuit_open", "rate_limited"):
+            # Model is known but all nodes are temporarily unavailable — fail fast
+            retry_after = diagnosis["retry_after_secs"] or _cb_cooldown_secs()
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "message": f"Model '{model_name}' is temporarily unavailable: {diagnosis['reason'].replace('_', ' ')} on all nodes",
+                    "code": "model_unavailable",
+                    "x_llb_diagnosis": diagnosis,
+                },
+                headers={"Retry-After": str(retry_after), "x-request-id": request.headers.get("x-request-id", "")},
+            )
+        # Model is cold/unknown — try on-demand warm
         try:
             t0_warm = time.monotonic()
             waited = await _on_demand_wait_for_model(model_name)
@@ -2332,6 +2517,7 @@ async def chat_completions(request: Request):
                     model_name = fb_model
                     eligible_nodes = fb_nodes
     request_id = request.headers.get("x-request-id") or str(uuid.uuid4())
+    _llb_hdrs = await _routing_headers(model_name, len(eligible_nodes))
 
     # Check for multi-backend execution mode or fallback chain
     exec_config = _parse_execution_mode(request)
@@ -2424,7 +2610,7 @@ async def chat_completions(request: Request):
                     raise RateLimitError(node, retry_after_secs)
                 # Treat 5xx and 404 as retryable failure across nodes
                 if response.status_code and (response.status_code >= 500 or response.status_code == 404):
-                    await _record_failure(node)
+                    await _record_failure(node, model_name)
                     raise httpx.HTTPStatusError("Upstream retryable error", request=response.request, response=response)
 
                 # Stream with optional SSE transformation for cloud backends
@@ -2480,7 +2666,7 @@ async def chat_completions(request: Request):
                         yield chunk
                     if _beta > 0 and _last_completion_tokens > 0:
                         await _record_output_tokens(model_name, node, _last_completion_tokens)
-            await _record_success(node)
+            await _record_success(node, model_name)
             await _clear_rate_limit(node)
         finally:
             await _dec_inflight(node)
@@ -2793,6 +2979,7 @@ async def chat_completions(request: Request):
                 "x-warm-wait-ms": str(warm_wait_ms),
                 "x-capacity-state": "ok",
                 "x-model-defaulted": "true" if model_defaulted else "false",
+                **_llb_hdrs,
             })
         else:
             # Pre-check: if all nodes saturated (inflight >= maxconn), respond 429 immediately
@@ -2849,6 +3036,7 @@ async def chat_completions(request: Request):
                 "x-warm-wait-ms": str(warm_wait_ms),
                 "x-capacity-state": "ok",
                 "x-model-defaulted": "true" if model_defaulted else "false",
+                **_llb_hdrs,
             })
 
     # Non-streaming behavior: aggregate JSON and return a Response
@@ -2898,7 +3086,7 @@ async def chat_completions(request: Request):
                         raise RateLimitError(node, retry_after_secs)
                     # Treat 5xx and 404 as retryable across nodes (LM Studio variants sometimes 404 chat endpoint)
                     if status_code and (status_code >= 500 or status_code == 404):
-                        await _record_failure(node)
+                        await _record_failure(node, model_name)
                         raise httpx.HTTPStatusError("Upstream retryable error", request=None, response=None)
                     chunks = bytearray()
                     async for chunk in response.aiter_bytes():
@@ -2913,9 +3101,9 @@ async def chat_completions(request: Request):
                 raise RateLimitError(node, retry_after_secs)
             # Evaluate retry conditions for normal client path
             if status_code and (status_code >= 500 or status_code == 404):
-                await _record_failure(node)
+                await _record_failure(node, model_name)
                 raise httpx.HTTPStatusError("Upstream retryable error", request=None, response=None)
-            await _record_success(node)
+            await _record_success(node, model_name)
             await _clear_rate_limit(node)
             # Cost-aware P2C: record output tokens in EWMA when beta > 0
             if float(getattr(config, "P2C_BETA", 0.0)) > 0 and status_code == 200:
@@ -2942,6 +3130,8 @@ async def chat_completions(request: Request):
             out.headers["x-warm-wait-ms"] = str(warm_wait_ms)
             out.headers["x-capacity-state"] = "ok"
             out.headers["x-model-defaulted"] = "true" if model_defaulted else "false"
+            for hk, hv in _llb_hdrs.items():
+                out.headers[hk] = hv
             # Success: set sticky mapping
             await _set_sticky_node(session_id, model_name, node)
             # AILB-MT-1: emit complexity routing telemetry record
@@ -3427,6 +3617,19 @@ async def embeddings(request: Request):
     on_demand_wait = False
     warm_wait_ms = 0
     if not eligible_nodes:
+        # Diagnose why before deciding whether to warm or fail fast
+        diagnosis = await _diagnose_unroutable(model_name)
+        if diagnosis["reason"] in ("circuit_open", "rate_limited"):
+            retry_after = diagnosis["retry_after_secs"] or _cb_cooldown_secs()
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "message": f"Model '{model_name}' is temporarily unavailable: {diagnosis['reason'].replace('_', ' ')} on all nodes",
+                    "code": "model_unavailable",
+                    "x_llb_diagnosis": diagnosis,
+                },
+                headers={"Retry-After": str(retry_after), "x-request-id": request.headers.get("x-request-id", "")},
+            )
         try:
             t0_warm = time.monotonic()
             waited = await _on_demand_wait_for_model(model_name)
@@ -3440,6 +3643,7 @@ async def embeddings(request: Request):
         raise HTTPException(status_code=404, detail=f"No healthy nodes found for model '{model_name}'.")
 
     start_time = time.monotonic()
+    _llb_hdrs = await _routing_headers(model_name, len(eligible_nodes))
     headers = {key: value for key, value in request.headers.items() if key.lower() not in ('host', 'content-length')}
     request_id = request.headers.get("x-request-id") or str(uuid.uuid4())
     headers["x-request-id"] = request_id
@@ -3482,7 +3686,7 @@ async def embeddings(request: Request):
                         await _record_rate_limit(node, retry_after_secs)
                         raise RateLimitError(node, retry_after_secs)
                     if status_code and status_code >= 500:
-                        await _record_failure(node)
+                        await _record_failure(node, model_name)
                         raise httpx.HTTPStatusError("Upstream 5xx", request=None, response=None)
                     chunks = bytearray()
                     async for chunk in response.aiter_bytes():
@@ -3496,9 +3700,9 @@ async def embeddings(request: Request):
                 await _record_rate_limit(node, retry_after_secs)
                 raise RateLimitError(node, retry_after_secs)
             if status_code and status_code >= 500:
-                await _record_failure(node)
+                await _record_failure(node, model_name)
                 raise httpx.HTTPStatusError("Upstream 5xx", request=None, response=None)
-            await _record_success(node)
+            await _record_success(node, model_name)
             await _clear_rate_limit(node)
             out = Response(content=content, media_type=ctype, status_code=status_code)
             out.headers["x-selected-model"] = model_name
@@ -3508,6 +3712,8 @@ async def embeddings(request: Request):
             out.headers["x-warm-wait-ms"] = str(warm_wait_ms)
             out.headers["x-capacity-state"] = "ok"
             out.headers["x-model-defaulted"] = "true" if model_defaulted else "false"
+            for hk, hv in _llb_hdrs.items():
+                out.headers[hk] = hv
             await _set_sticky_node(session_id, model_name, node)
             return out
         finally:
@@ -3585,23 +3791,51 @@ async def embeddings(request: Request):
     raise HTTPException(status_code=502, detail={"message": "All upstream nodes failed for embeddings model.", "model": model_name, "attempts": attempts, "nodes": tried_order}, headers={"x-request-id": request_id, "x-attempts": str(attempts), "x-failover-count": str(max(0, attempts-1))})
 
 @app.get("/health", status_code=200)
-async def health_check(response: Response):
-    """Checks the health of the load balancer and its node cluster."""
+async def health_check(request: Request, response: Response):
+    """Checks the health of the load balancer and its node cluster.
+
+    Query params:
+      models=true  — include per-model availability breakdown.
+    """
     healthy_node_count = await redis_client.scard("nodes:healthy")
-    
+    include_models = request.query_params.get("models", "false").lower() in ("1", "true", "yes")
+
     if healthy_node_count >= config.MIN_HEALTHY_NODES:
-        return {
-            "status": "healthy",
-            "nodes_found": healthy_node_count,
-            "minimum_required": config.MIN_HEALTHY_NODES
-        }
+        status = "healthy"
     else:
+        status = "unhealthy"
+
+    result = {
+        "status": status,
+        "nodes_found": healthy_node_count,
+        "minimum_required": config.MIN_HEALTHY_NODES,
+    }
+
+    if include_models:
+        all_models = await _aggregate_models()
+        models_status = {}
+        any_unavailable = False
+        for m in all_models:
+            mid = m.get("id")
+            if not mid:
+                continue
+            avail = await _model_availability(mid)
+            models_status[mid] = {
+                "status": avail["status"],
+                "eligible_nodes": avail["eligible_nodes"],
+                "total_nodes": avail["total_nodes"],
+            }
+            if avail["status"] == "unavailable" and avail["total_nodes"] > 0:
+                any_unavailable = True
+        result["models"] = models_status
+        # Upgrade to degraded if nodes are healthy but some known models are unroutable
+        if status == "healthy" and any_unavailable and getattr(config, "HEALTH_MODEL_AWARE", False):
+            result["status"] = "degraded"
+
+    if result["status"] == "unhealthy":
         response.status_code = 503
-        return {
-            "status": "unhealthy",
-            "nodes_found": healthy_node_count,
-            "minimum_required": config.MIN_HEALTHY_NODES
-        }
+
+    return result
 
 @app.get("/metrics")
 async def metrics():

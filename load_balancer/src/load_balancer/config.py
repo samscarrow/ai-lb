@@ -148,6 +148,10 @@ SAME_NODE_RETRY_DELAY_SECS = float(os.getenv("SAME_NODE_RETRY_DELAY_SECS", 3.0))
 CIRCUIT_BREAKER_COOLDOWN_SECS = int(os.getenv("CIRCUIT_BREAKER_COOLDOWN_SECS", 60))
 CIRCUIT_BREAKER_SUSPECT_THRESHOLD = int(os.getenv("CIRCUIT_BREAKER_SUSPECT_THRESHOLD", 1))
 CIRCUIT_BREAKER_SUSPECT_WEIGHT = float(os.getenv("CIRCUIT_BREAKER_SUSPECT_WEIGHT", 0.5))
+# CB scope: "model" = per-(node,model) keys + node-wide aggregate; "node" = legacy per-node only
+CB_SCOPE = os.getenv("LLB_CB_SCOPE", "model").lower()
+# When true, /health returns "degraded" (HTTP 200) if any known model has zero eligible nodes
+HEALTH_MODEL_AWARE = os.getenv("LLB_HEALTH_MODEL_AWARE", "false").lower() in ("1", "true", "yes")
 
 # Hedging configuration
 HEDGING_ENABLED = os.getenv("HEDGING_ENABLED", "true").lower() in ("1", "true", "yes")
