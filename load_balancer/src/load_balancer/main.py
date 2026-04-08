@@ -3572,13 +3572,19 @@ async def responses_api(request: Request):
             logger.warning("responses_api: dropping tool call with empty function name (model=%s)",
                            raw.get("model", "?"))
             continue
+        # Parse arguments string to object — OpenClaw expects a JSON object,
+        # not the JSON-encoded string that Ollama/OpenAI chat completions returns.
+        try:
+            fn_args_obj = json.loads(fn_args) if isinstance(fn_args, str) else fn_args
+        except (json.JSONDecodeError, TypeError):
+            fn_args_obj = {}
         logger.info("responses_api: tool_call name=%s args=%s", fn_name, repr(fn_args)[:200])
         output.append({
             "type": "function_call",
             "id": f"fc_{uuid.uuid4().hex[:24]}",
             "call_id": tc.get("id", f"call_{uuid.uuid4().hex[:24]}"),
             "name": fn_name,
-            "arguments": fn_args,
+            "arguments": fn_args_obj,
         })
 
     # Text content (some models put text in "reasoning" instead of "content")
