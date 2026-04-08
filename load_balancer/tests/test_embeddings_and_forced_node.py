@@ -204,8 +204,8 @@ def test_embeddings_missing_input_returns_400():
     with make_client() as c:
         resp = c.post("/v1/embeddings", json={"model": "em"})
         assert resp.status_code == 400
-        detail = resp.json().get("detail")
-        assert detail["missing"] == ["input"]
+        error = resp.json().get("error")
+        assert error["missing"] == ["input"]
 
 
 def test_embeddings_auto_with_intersection_pref(monkeypatch):

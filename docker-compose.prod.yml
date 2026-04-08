@@ -1,0 +1,76 @@
+# docker-compose.prod.yml
+# Production overlay — merge with base docker-compose.yml.
+# Usage: docker compose -f docker-compose.yml -f docker-compose.prod.yml --profile full up -d
+#
+# Prerequisites:
+#   - /etc/llb/prod.env populated (see docs/ds7-production-deployment-spec.md §2.4)
+#   - /run/secrets/anthropic_api_key and /run/secrets/openai_api_key created (chmod 600)
+#   - /var/lib/llb/redis/ directory exists and is writable by the redis container
+#   - /var/log/llb/ directory exists and is writable by uid 1001
+
+x-redis-env: &redis-env
+  REDIS_HOST: localhost
+  REDIS_PORT: 6379
+
+secrets:
+  anthropic_api_key:
+    file: /run/secrets/anthropic_api_key
+  openai_api_key:
+    file: /run/secrets/openai_api_key
+
+services:
+  redis:
+    image: "redis:7-alpine"
+    restart: always
+    network_mode: host
+    volumes:
+      - redis_data:/data
+      - ./config/redis.prod.conf:/usr/local/etc/redis/redis.conf:ro
+    command: ["redis-server", "/usr/local/etc/redis/redis.conf"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  monitor:
+    image: "localhost:5000/llb-monitor:latest"
+    network_mode: host
+    restart: always
+    env_file: /etc/llb/prod.env
+    environment:
+      <<: *redis-env
+    depends_on:
+      redis:
+        condition: service_healthy
+    profiles: ["full"]
+
+  load_balancer:
+    image: "localhost:5000/llb:latest"
+    network_mode: host
+    restart: always
+    env_file: /etc/llb/prod.env
+    environment:
+      <<: *redis-env
+      # Secrets are mounted as files — NOT passed as env vars.
+      # config.py reads /run/secrets/anthropic_api_key and /run/secrets/openai_api_key at startup.
+    secrets:
+      - anthropic_api_key
+      - openai_api_key
+    depends_on:
+      redis:
+        condition: service_healthy
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+volumes:
+  redis_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /var/lib/llb/redis

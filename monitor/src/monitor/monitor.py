@@ -1,12 +1,30 @@
 import asyncio
+import json
 import httpx
 import redis.asyncio as redis
 import config
 
 # Set a timeout for network requests
 CLIENT_TIMEOUT = httpx.Timeout(30.0)
-# Keys should expire if a node is not seen for 2 scan intervals
-KEY_EXPIRY_SECONDS = config.SCAN_INTERVAL * 2
+# Keys should expire if a node is not seen for 5 scan intervals
+KEY_EXPIRY_SECONDS = config.SCAN_INTERVAL * 5
+
+async def _fetch_available_models(session: httpx.AsyncClient, node_address: str) -> list[dict]:
+    """Fetch all models a node can serve, including cold (downloaded but unloaded) ones.
+
+    Ollama's /v1/models only lists models currently loaded in VRAM.
+    /api/tags lists all downloaded models. We merge both so the LB knows
+    about cold models that can be loaded on demand.
+    """
+    try:
+        resp = await session.get(f"http://{node_address}/api/tags")
+        if resp.status_code == 200:
+            tags = resp.json().get("models", [])
+            return [{"id": m["name"], "object": "model", "owned_by": "ollama"} for m in tags]
+    except Exception:
+        pass
+    return []
+
 
 async def check_node(redis_client: redis.Redis, session: httpx.AsyncClient, host: str, port: int):
     """
@@ -21,12 +39,23 @@ async def check_node(redis_client: redis.Redis, session: httpx.AsyncClient, host
 
         # If we get a successful response, the node is healthy
         models_data = response.json()
-        print(f"✅ Found healthy node: {node_address} with {len(models_data.get('data', []))} models.")
+        loaded_models = models_data.get("data", [])
+
+        # Also fetch all downloaded (cold) models via Ollama's /api/tags
+        available_models = await _fetch_available_models(session, node_address)
+        if available_models:
+            loaded_ids = {m.get("id") for m in loaded_models}
+            for m in available_models:
+                if m["id"] not in loaded_ids:
+                    loaded_models.append(m)
+            models_data["data"] = loaded_models
+
+        print(f"✅ Found healthy node: {node_address} with {len(loaded_models)} models ({len(available_models)} available via /api/tags).")
 
         # Create a pipeline to execute Redis commands atomically
         async with redis_client.pipeline() as pipe:
             pipe.sadd("nodes:healthy", node_address)
-            pipe.set(f"node:{node_address}:models", response.text)
+            pipe.set(f"node:{node_address}:models", json.dumps(models_data))
             # Apply optional per-node concurrency cap
             maxconn = None
             # Explicit map takes precedence
@@ -48,9 +77,12 @@ async def check_node(redis_client: redis.Redis, session: httpx.AsyncClient, host
 
     except (httpx.RequestError, httpx.HTTPStatusError) as e:
         # If the node was previously healthy, remove it
-        if await redis_client.sismember("nodes:healthy", node_address):
+        is_healthy = await redis_client.sismember("nodes:healthy", node_address)
+        if is_healthy:
             print(f"❌ Node {node_address} is no longer healthy. Removing. Reason: {e}")
             await redis_client.srem("nodes:healthy", node_address)
+        else:
+            print(f"⚠️ Node {node_address} check failed. Reason: {repr(e)}")
     except Exception as e:
         print(f"An unexpected error occurred while checking {node_address}: {e}")
 
@@ -89,19 +121,76 @@ async def warm_models(redis_client: redis.Redis, session: httpx.AsyncClient, nod
         except Exception:
             pass
 
+async def register_cloud_backends(redis_client: redis.Redis):
+    """
+    Register cloud backends from config without probing.
+    Cloud APIs don't expose /v1/models the same way as local backends.
+    """
+    cloud_backends = getattr(config, "CLOUD_BACKENDS", {}) or {}
+    cloud_models = getattr(config, "CLOUD_MODELS", {}) or {}
+
+    if not cloud_backends:
+        return
+
+    print(f"Registering {len(cloud_backends)} cloud backend(s)...")
+
+    for name, backend_config in cloud_backends.items():
+        url = backend_config.get("url", "")
+        if not url:
+            continue
+
+        # Extract host:port from URL for node addressing
+        # URL format: https://api.openai.com/v1 -> use name as identifier
+        # We use the backend name as the node identifier for cloud backends
+        node_address = f"cloud:{name}"
+
+        # Get models for this backend
+        models = cloud_models.get(name, [])
+
+        # Build models list in OpenAI format
+        models_data = {
+            "object": "list",
+            "data": [
+                {"id": model, "object": "model", "owned_by": name}
+                for model in models
+            ]
+        }
+
+        try:
+            async with redis_client.pipeline() as pipe:
+                pipe.sadd("nodes:healthy", node_address)
+                pipe.set(f"node:{node_address}:models", json.dumps(models_data))
+                pipe.set(f"node:{node_address}:is_cloud", "1")
+                pipe.set(f"node:{node_address}:cloud_name", name)
+                pipe.set(f"node:{node_address}:cloud_url", url)
+                # Cloud backends typically don't have concurrency limits enforced here
+                # Set expiry same as other nodes
+                pipe.expire("nodes:healthy", KEY_EXPIRY_SECONDS)
+                pipe.expire(f"node:{node_address}:models", KEY_EXPIRY_SECONDS)
+                pipe.expire(f"node:{node_address}:is_cloud", KEY_EXPIRY_SECONDS)
+                pipe.expire(f"node:{node_address}:cloud_name", KEY_EXPIRY_SECONDS)
+                pipe.expire(f"node:{node_address}:cloud_url", KEY_EXPIRY_SECONDS)
+                await pipe.execute()
+
+            print(f"☁️  Registered cloud backend: {node_address} with {len(models)} model(s): {models}")
+        except Exception as e:
+            print(f"Error registering cloud backend {name}: {e}")
+
+
 async def main():
     """
     Main monitoring loop.
     """
     print("Monitor service started.")
     print(f"Connecting to Redis at {config.REDIS_HOST}:{config.REDIS_PORT}")
-    
+
     redis_client = redis.Redis(host=config.REDIS_HOST, port=config.REDIS_PORT, decode_responses=True)
 
     try:
         # Parse host and port configurations. SCAN_HOSTS supports either plain hosts
         # or host:port pairs. Plain hosts are combined with SCAN_PORTS.
-        raw_hosts = [h.strip() for h in config.SCAN_HOSTS.split(',') if h.strip()]
+        normalized_hosts = config.SCAN_HOSTS.replace(';', ',').replace(' ', ',')
+        raw_hosts = [h.strip() for h in normalized_hosts.split(',') if h.strip()]
         explicit_pairs = []  # list of (host, port)
         hosts_no_port = []
         for h in raw_hosts:
@@ -110,7 +199,9 @@ async def main():
                 explicit_pairs.append((host, int(port_str)))
             else:
                 hosts_no_port.append(h)
-        ports = [int(p.strip()) for p in config.SCAN_PORTS.split(',') if p.strip()]
+        
+        normalized_ports = config.SCAN_PORTS.replace(';', ',').replace(' ', ',')
+        ports = [int(p.strip()) for p in normalized_ports.split(',') if p.strip()]
 
         pairs = list(explicit_pairs)
         for h in hosts_no_port:
@@ -128,7 +219,10 @@ async def main():
     async with httpx.AsyncClient(timeout=CLIENT_TIMEOUT) as session:
         while True:
             print("--- Starting network scan ---")
-            
+
+            # Register cloud backends (no probing needed)
+            await register_cloud_backends(redis_client)
+
             # Create a list of tasks for all hosts and ports to check
             tasks = []
             for host, port in pairs:
