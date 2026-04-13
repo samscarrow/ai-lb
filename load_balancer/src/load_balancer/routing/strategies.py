@@ -350,11 +350,12 @@ class ComplexityRoutingStrategy(RoutingStrategy):
     def score_prompt_complexity(messages: List[Dict]) -> float:
         """Score prompt complexity from OpenAI-format messages. Returns [0.0, 1.0].
 
-        Four weighted signals (weights sum to exactly 1.0, no external calls):
+        Signals:
           - Character count:    weight 0.30  linear scale, cap at 10 000 chars
           - Code fences (```):  weight 0.20  cap at 3 occurrences
           - Multi-step markers: weight 0.25  cap at 4 phrase matches (case-insensitive)
           - Reasoning keywords: weight 0.25  cap at 3 keyword matches (case-insensitive)
+          - Vision/Multimodal:  weight 0.60  binary (deterministic: if image is present)
 
         Each signal is individually clamped to [0, max_weight] before summing.
         The total is clamped to [0.0, 1.0].
@@ -366,15 +367,20 @@ class ComplexityRoutingStrategy(RoutingStrategy):
 
         # Extract all text content from OpenAI-format messages
         text_parts: List[str] = []
+        has_image = False
         for m in messages:
             content = m.get("content") or ""
             if isinstance(content, str):
                 text_parts.append(content)
             elif isinstance(content, list):
-                # Vision / multimodal: only text blocks contribute
+                # Vision / multimodal: detect images and collect text
                 for block in content:
-                    if isinstance(block, dict):
-                        text_parts.append(block.get("text", ""))
+                    if not isinstance(block, dict):
+                        continue
+                    # Deterministic check for image content
+                    if block.get("type") in ("image_url", "image"):
+                        has_image = True
+                    text_parts.append(block.get("text", ""))
         raw_text = " ".join(text_parts)
         # Lowercase for case-insensitive matching; length uses raw (same char count)
         text = raw_text.lower()
@@ -400,6 +406,11 @@ class ComplexityRoutingStrategy(RoutingStrategy):
         ]
         keyword_count = sum(1 for kw in reasoning_keywords if kw in text)
         score += min(keyword_count / 3, 1.0) * 0.25
+
+        # Signal 5: Vision/Multimodal content (weight 0.60)
+        # Deterministic: image presence implies high visual complexity
+        if has_image:
+            score += 0.60
 
         return min(1.0, score)
 

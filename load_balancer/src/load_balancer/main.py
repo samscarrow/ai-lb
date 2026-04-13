@@ -917,6 +917,24 @@ class ExtendedExecutionConfig:
     fallback_chain: Optional[str] = None  # Name of fallback chain to use
 
 
+def _infer_required_capabilities(body: Dict[str, Any]) -> Optional[frozenset]:
+    """Infers required backend capabilities by inspecting the request body.
+
+    Currently detects:
+      - vision: presence of image content in messages
+
+    Inspired by Perplexity Computer-style specialized routing.
+    """
+    messages = body.get("messages", [])
+    for m in messages:
+        content = m.get("content")
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") in ("image_url", "image"):
+                    return frozenset({"vision"})
+    return None
+
+
 def _parse_execution_mode(request: Request) -> Optional[ExtendedExecutionConfig]:
     """Parse execution mode from request headers or query params.
 
@@ -2533,6 +2551,41 @@ async def chat_completions(request: Request):
 
     # Check for multi-backend execution mode or fallback chain
     exec_config = _parse_execution_mode(request)
+    
+    # Infer required capabilities from body (deterministic vision detection)
+    inferred_caps = _infer_required_capabilities(body)
+    if inferred_caps:
+        if exec_config:
+            # Merge: user-provided in headers + inferred from body
+            combined = set(inferred_caps)
+            if exec_config.required_capabilities:
+                combined.update(exec_config.required_capabilities)
+            exec_config.required_capabilities = frozenset(combined)
+        else:
+            # Create a default config to hold inferred capabilities
+            exec_config = ExtendedExecutionConfig(
+                base=ExecutionConfig(mode=ExecutionMode.RACE, max_backends=1),
+                required_capabilities=inferred_caps
+            )
+
+    # Apply capability filtering if any required (headers or inferred)
+    if exec_config and exec_config.required_capabilities:
+        filtered_nodes = _filter_nodes_by_capability(eligible_nodes, exec_config.required_capabilities)
+        # If filtering for a REQUIRED capability (like vision) returns nothing, 
+        # we don't fall back to all nodes — that would just result in 400s.
+        if not filtered_nodes:
+            logger.warning(
+                "[req=%s] No nodes found for model '%s' matching capabilities %s",
+                request_id, model_name, sorted(exec_config.required_capabilities)
+            )
+            # Only fail if it's a structural requirement (like vision)
+            if "vision" in exec_config.required_capabilities:
+                raise HTTPException(
+                    status_code=404, 
+                    detail=f"No vision-capable backends available for model '{model_name}'."
+                )
+        else:
+            eligible_nodes = filtered_nodes
 
     # Handle fallback chain execution (takes precedence over other modes)
     if exec_config and exec_config.fallback_chain:
