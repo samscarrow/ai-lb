@@ -843,3 +843,81 @@ class TestOracleHTTPIntegration:
             assert resp.status_code == 200
             # Should have invalid oracle header
             assert resp.headers.get("x-consensus-oracle") == "invalid"
+
+
+# ---------------------------------------------------------------------------
+# Regression: the PLAN path must run the cloud planner on the backend's OWN
+# model, and a model-scoped-key 4xx must be a loud failure -- not swallowed as
+# empty content (which was misclassified downstream as planner_bad_json).
+# ---------------------------------------------------------------------------
+class TestPlanCloudPlannerModelAnd4xx:
+
+    def test_plan_cloud_call_model_coerces_to_backend_model(self):
+        lb_config.CLOUD_BACKENDS = {"glm52": {"url": "http://gw/v1", "api_key": "k", "is_cloud": True}}
+        lb_config.CLOUD_MODELS = {"glm52": ["glm-5.2"]}
+        # The caller's execution model (or "auto") is NOT what the scoped key serves,
+        # so the planner call must be coerced to the backend's own model (glm-5.2)
+        # rather than leaking the caller's model (which 403s on the scoped key).
+        assert lb_main._plan_cloud_call_model("cloud:glm52", "qwen2.5:32b") == "glm-5.2"
+        assert lb_main._plan_cloud_call_model("cloud:glm52", "auto") == "glm-5.2"
+        # An explicit request for a model the backend DOES serve is preserved.
+        assert lb_main._plan_cloud_call_model("cloud:glm52", "glm-5.2") == "glm-5.2"
+
+    def test_plan_cloud_call_model_local_and_unconfigured_passthrough(self):
+        lb_config.CLOUD_BACKENDS = {"glm52": {"url": "http://gw/v1", "api_key": "k", "is_cloud": True}}
+        lb_config.CLOUD_MODELS = {}  # backend advertises no model
+        # Local backend -> None (send the caller's model unchanged).
+        assert lb_main._plan_cloud_call_model("100.64.0.7:11434", "qwen3:32b") is None
+        # Cloud backend with no CLOUD_MODELS entry -> None (preserve prior behavior).
+        assert lb_main._plan_cloud_call_model("cloud:glm52", "qwen2.5:32b") is None
+
+    def test_make_backend_request_applies_model_override_to_body(self):
+        # The coerced model must actually reach the wire: request body model rewritten.
+        sent = []
+
+        class _Recorder:
+            async def post(self, url, json=None, headers=None, timeout=None):
+                sent.append(json)
+                return FakeResponse({"choices": [{"message": {"content": "ok"}}]}, status_code=200)
+
+            async def aclose(self):
+                return True
+
+        lb_main.http_client = _Recorder()
+        body = {"model": "qwen2.5:32b", "messages": [{"role": "user", "content": "hi"}]}
+        res = run(lb_main._make_backend_request(
+            "10.0.0.9:11434", body, {}, "qwen2.5:32b", "req-1", 0.0,
+            backend_model_override="glm-5.2",
+        ))
+        assert res.success is True
+        assert sent and sent[0]["model"] == "glm-5.2"
+        # The caller's body dict must not be mutated.
+        assert body["model"] == "qwen2.5:32b"
+
+    def test_make_backend_request_4xx_is_loud_failure(self):
+        # A 403 (scoped key denies the model) must be a FAILURE, not a "success"
+        # carrying an error body -- otherwise it surfaces as empty content and is
+        # misclassified as planner_bad_json.
+        lb_main.http_client = FakeHTTPClient({
+            "10.0.0.9:11434": {"status": 403,
+                               "response": {"error": {"message": "key not allowed to access model"}}},
+        })
+        body = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
+        res = run(lb_main._make_backend_request(
+            "10.0.0.9:11434", body, {}, "m", "req-2", 0.0,
+        ))
+        assert res.success is False
+        assert "403" in (res.error or "")
+
+    def test_make_backend_request_200_still_succeeds(self):
+        # Guard: the 4xx change must not regress the 2xx success path.
+        lb_main.http_client = FakeHTTPClient({
+            "10.0.0.9:11434": {"status": 200,
+                               "response": {"choices": [{"message": {"content": "ok"}}]}},
+        })
+        body = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
+        res = run(lb_main._make_backend_request(
+            "10.0.0.9:11434", body, {}, "m", "req-3", 0.0,
+        ))
+        assert res.success is True
+        assert res.response_body["choices"][0]["message"]["content"] == "ok"

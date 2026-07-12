@@ -1276,6 +1276,28 @@ async def _get_backend_model(backend: str, requested_model: str) -> Optional[str
         return None
 
 
+def _plan_cloud_call_model(backend_node: str, requested_model: str) -> Optional[str]:
+    """Model to send when the PLAN path calls a CLOUD backend.
+
+    A cloud backend serves exactly the models it advertises in CLOUD_MODELS and its API
+    key is scoped to them, so the planner must decompose/assemble on the backend's OWN
+    model (e.g. glm-5.2) rather than the caller's execution model or "auto" -- otherwise
+    the gateway rejects the scoped key with a 403 that used to be swallowed as empty
+    content. Returns None for local/unconfigured backends (send the model as-is), and
+    keeps the requested model when the backend actually serves it (an explicit glm-5.2
+    request is untouched).
+    """
+    if not _is_cloud_backend(backend_node):
+        return None
+    cloud_name = _get_cloud_backend_name(backend_node)
+    allowed = (getattr(config, "CLOUD_MODELS", {}) or {}).get(cloud_name) or []
+    if not allowed:
+        return None
+    if requested_model in allowed:
+        return requested_model
+    return allowed[0]
+
+
 async def _get_eligible_nodes_for_equivalents(model_name: str) -> List[str]:
     """Get eligible nodes that have the requested model OR any equivalent model."""
     equivalent_models = _get_equivalent_models(model_name)
@@ -1560,7 +1582,11 @@ async def _make_backend_request(
                         pass
                 await _record_rate_limit(backend, retry_after_secs)
                 result.error = f"HTTP 429 Rate Limited"
-            elif resp.status_code >= 500 or resp.status_code == 404:
+            elif resp.status_code >= 400:
+                # Any non-2xx/3xx is a failure -- never a "success" carrying an error body.
+                # Previously only >=500/404 failed, so a 4xx (e.g. a 403 from a model-scoped
+                # gateway key) fell through to the success branch below and surfaced as empty
+                # content, misclassified downstream as planner_bad_json. Make it loud.
                 await _record_failure(backend, model_name)
                 result.error = f"HTTP {resp.status_code}"
             else:
@@ -1593,7 +1619,8 @@ async def _make_backend_request(
                             pass
                     await _record_rate_limit(backend, retry_after_secs)
                     result.error = f"HTTP 429 Rate Limited"
-                elif result.status_code >= 500 or result.status_code == 404:
+                elif result.status_code >= 400:
+                    # 4xx and 5xx are failures, not successes with an error body (see above).
                     await _record_failure(backend, model_name)
                     result.error = f"HTTP {result.status_code}"
                 else:
@@ -2197,6 +2224,18 @@ async def _handle_multi_backend_execution(
         if ("text/event-stream" in accept_header) or body.get("stream"):
             async def _sse_call_backend(node: str, messages: list) -> str:
                 plan_body = {**body, "messages": messages, "stream": False}
+                # A cloud planner/executor needs the full cloud path (URL + scoped key +
+                # adapter + status handling) and must run its OWN model -- a bare local POST
+                # can't reach it and would leak the caller's model. Reuse _make_backend_request.
+                if _is_cloud_backend(node):
+                    res = await _make_backend_request(
+                        node, plan_body, headers, model_name, request_id, start_time,
+                        backend_model_override=_plan_cloud_call_model(node, model_name),
+                    )
+                    if not res.success or not res.response_body:
+                        raise RuntimeError(res.error or "cloud planner call failed")
+                    msg = (res.response_body.get("choices") or [{}])[0].get("message", {}) or {}
+                    return msg.get("content") or ""
                 resp = await http_client.post(
                     f"http://{node}/v1/chat/completions",
                     json=plan_body,
@@ -2287,8 +2326,13 @@ async def _handle_multi_backend_execution(
                 plan_body = dict(body)
                 plan_body["messages"] = plan_messages
                 plan_body.pop("stream", None)  # planner calls are non-streaming
+                # Planner decomposes/assembles on the backend's OWN model (e.g. the cloud
+                # planner's glm-5.2), NOT the caller's execution model -- otherwise a cloud
+                # planner is handed the caller's model and 403s on its scoped key.
+                override = _plan_cloud_call_model(backend_node, model_name)
                 return await _make_backend_request(
                     backend_node, plan_body, headers, model_name, request_id, start_time,
+                    backend_model_override=override,
                 )
 
             plan_result = None
